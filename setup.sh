@@ -256,6 +256,16 @@ if [[ -f "$HOME/.claude.json" ]] && grep -q '"github"' "$HOME/.claude.json" 2>/d
   echo "GitHub MCP server detected"
 fi
 
+PAT_OK=false
+if [[ -n "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]]; then
+  PAT_OK=true
+  echo "GitHub PAT detected"
+else
+  echo "WARNING: GITHUB_PERSONAL_ACCESS_TOKEN not set."
+  echo "  Required for label creation and GitHub MCP server."
+  echo "  export GITHUB_PERSONAL_ACCESS_TOKEN=ghp_..."
+fi
+
 if [[ "$MCP_OK" == "false" ]]; then
   echo "WARNING: GitHub MCP server not detected. The agent loops require it."
   echo "  Run this to configure it:"
@@ -717,7 +727,7 @@ cat >> LOOPS.md << 'ONESHOT_HEADER'
 
 ## One-Shot Setup (run these first, once)
 
-Paste these one at a time in a Claude Code session before starting the recurring loops.
+These tasks run automatically via 00-setup.txt when the fleet starts. Re-run manually if needed:
 ONESHOT_HEADER
 
 # Label setup one-shot (if AUTO_LABELS)
@@ -727,7 +737,12 @@ if [[ "$AUTO_LABELS" == "true" ]]; then
 
 ### Label Setup
 \`\`\`
-You are a Label Setup helper for ${GITHUB_USER}/${GITHUB_REPO}. Create the following GitHub labels. For each label, use mcp__github__get_label to check if it exists first — skip if it does. Create missing labels using the GitHub API via available MCP tools.
+You are a Label Setup helper for ${GITHUB_USER}/${GITHUB_REPO}. Create the following GitHub labels using the GitHub REST API via curl. The PAT is in \$GITHUB_PERSONAL_ACCESS_TOKEN.
+
+For each label, check if it exists:
+  curl -sf -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels/<name>
+Create missing labels:
+  curl -sf -X POST -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels -d '{"name":"<name>","color":"<color>","description":"<desc>"}'
 
 Labels to create:
 - claude-ready (color: 0E8A16, description: "Add to issues for agent triage")
@@ -744,7 +759,12 @@ LABEL_EOF
 
 ### Label Setup
 \`\`\`
-You are a Label Setup helper for ${GITHUB_USER}/${GITHUB_REPO}. Create the following GitHub labels. For each label, use mcp__github__get_label to check if it exists first — skip if it does. Create missing labels using the GitHub API via available MCP tools.
+You are a Label Setup helper for ${GITHUB_USER}/${GITHUB_REPO}. Create the following GitHub labels using the GitHub REST API via curl. The PAT is in \$GITHUB_PERSONAL_ACCESS_TOKEN.
+
+For each label, check if it exists:
+  curl -sf -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels/<name>
+Create missing labels:
+  curl -sf -X POST -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels -d '{"name":"<name>","color":"<color>","description":"<desc>"}'
 
 Labels to create:
 - claude-ready (color: 0E8A16, description: "Add to issues for agent pickup")
@@ -1247,6 +1267,85 @@ PROMPT_EOF
   [[ -n "$BUILD_CMD" ]] && LOOP_FILE_COUNT=$((LOOP_FILE_COUNT + 1))
   echo "Created .claude/loops/ ($LOOP_FILE_COUNT prompt files, single mode)"
 fi
+# ─── Generate 00-setup.txt one-shot ───────────────────────────────────
+ISSUE_LABEL="claude-ready"
+[[ "$MODEL_MODE" == "dual" ]] && ISSUE_LABEL="claude-opus"
+
+if [[ "$MODEL_MODE" == "dual" ]]; then
+  SETUP_LABELS='   - claude-ready (color: 0E8A16, description: "Add to issues for agent triage")
+   - claude-sonnet (color: 1D76DB, description: "Simple tasks for Sonnet session")
+   - claude-opus (color: 5319E7, description: "Complex tasks for Opus session")
+   - claude-wip (color: FBCA04, description: "Agent is working on this")
+   - claude-blocked (color: D93F0B, description: "Agent is stuck, needs human help")'
+else
+  SETUP_LABELS='   - claude-ready (color: 0E8A16, description: "Add to issues for agent pickup")
+   - claude-wip (color: FBCA04, description: "Agent is working on this")
+   - claude-blocked (color: D93F0B, description: "Agent is stuck, needs human help")'
+fi
+
+case "$LANG_TYPE" in
+  node)
+    SETUP_ISSUES="   Issue 1:
+     Title: \"chore: add vitest test infrastructure\"
+     Body: \"Set up vitest with React Testing Library. Create vitest.config.ts, test-setup.ts, and initial tests for utility functions and at least one component.\"
+     Label: $ISSUE_LABEL
+   Issue 2:
+     Title: \"fix: replace any types with strict alternatives\"
+     Body: \"Search all .ts/.tsx files for explicit any types and replace with correct specific types. Use unknown only when the type genuinely cannot be determined.\"
+     Label: $ISSUE_LABEL"
+    ;;
+  python)
+    SETUP_ISSUES="   Issue 1:
+     Title: \"chore: add pytest infrastructure with initial tests\"
+     Body: \"Set up pytest with conftest.py in tests/. Write initial tests for core modules.\"
+     Label: $ISSUE_LABEL
+   Issue 2:
+     Title: \"fix: add comprehensive type hints\"
+     Body: \"Search all .py files for functions missing type hints. Add type hints to all function parameters and return types.\"
+     Label: $ISSUE_LABEL"
+    ;;
+  go)
+    SETUP_ISSUES="   Issue 1:
+     Title: \"chore: add table-driven tests for core packages\"
+     Body: \"Identify key packages with no or minimal test coverage. Write table-driven tests following Go testing conventions.\"
+     Label: $ISSUE_LABEL
+   Issue 2:
+     Title: \"chore: add golangci-lint configuration\"
+     Body: \"Create .golangci.yml with sensible defaults (govet, errcheck, staticcheck, unused, gosimple). Fix any issues found.\"
+     Label: $ISSUE_LABEL"
+    ;;
+  rust)
+    SETUP_ISSUES="   Issue 1:
+     Title: \"chore: add comprehensive test coverage\"
+     Body: \"Identify modules with no or minimal test coverage. Add unit tests using #[cfg(test)] modules and integration tests in tests/.\"
+     Label: $ISSUE_LABEL
+   Issue 2:
+     Title: \"chore: enable strict clippy lints\"
+     Body: \"Add clippy configuration to Cargo.toml or clippy.toml with stricter lints. Fix all warnings.\"
+     Label: $ISSUE_LABEL"
+    ;;
+  *)
+    SETUP_ISSUES=""
+    ;;
+esac
+
+cat > .claude/loops/00-setup.txt << SETUP_EOF
+You are a Setup helper for ${GITHUB_USER}/${GITHUB_REPO}. Complete these tasks, then report results:
+
+1. LABELS — Create these GitHub labels using the GitHub REST API via curl. The PAT is in \$GITHUB_PERSONAL_ACCESS_TOKEN.
+   For each label, check if it exists first:
+     curl -sf -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels/<name>
+   Create missing labels:
+     curl -sf -X POST -H "Authorization: token \$GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/labels -d '{"name":"<name>","color":"<color>","description":"<desc>"}'
+$SETUP_LABELS
+
+2. ISSUES — Create these GitHub issues for one-shot setup tasks. Check for existing open issues with the same title first (mcp__github__list_issues with owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}) — skip duplicates.
+$(if [[ -n "$SETUP_ISSUES" ]]; then echo "$SETUP_ISSUES"; else echo "   (No language-specific setup issues for generic projects.)"; fi)
+
+Report: how many labels created/existed, how many issues created/skipped.
+SETUP_EOF
+echo "Created .claude/loops/00-setup.txt"
+
 # ─── Generate start-loops.sh ──────────────────────────────────────────
 
 if [[ "$MODEL_MODE" == "dual" ]]; then
@@ -1334,6 +1433,7 @@ send_loop() {
 
   tmux load-buffer -b loop-cmd "$file"
   tmux paste-buffer -b loop-cmd -t "$session"
+  sleep 1
   tmux send-keys -t "$session" Enter
   echo "   + $name"
   sleep 3
@@ -1358,6 +1458,12 @@ start_sonnet() {
   tmux new-session -d -s "$SONNET_SESSION" "claude --model claude-sonnet-4-6"
   echo "  Waiting for Claude to start..."
   sleep 8
+
+  # Run setup one-shot first
+  if [[ -f "$LOOP_DIR/00-setup.txt" ]]; then
+    echo "  Running setup one-shot..."
+    send_loop "$SONNET_SESSION" "$LOOP_DIR/00-setup.txt"
+  fi
 
   for f in "$LOOP_DIR"/0{1,2,3,4,5}-*.txt; do
     [[ -f "$f" ]] && send_loop "$SONNET_SESSION" "$f"
@@ -1486,6 +1592,7 @@ send_loop() {
 
   tmux load-buffer -b loop-cmd "\$file"
   tmux paste-buffer -b loop-cmd -t "\$session"
+  sleep 1
   tmux send-keys -t "\$session" Enter
   echo "   + \$name"
   sleep 3
@@ -1509,9 +1616,17 @@ tmux new-session -d -s "\$SESSION" "claude --model \$MODEL"
 echo "  Waiting for Claude to start..."
 sleep 8
 
+# Run setup one-shot first
+if [[ -f "\$LOOP_DIR/00-setup.txt" ]]; then
+  echo "  Running setup one-shot..."
+  send_loop "\$SESSION" "\$LOOP_DIR/00-setup.txt"
+fi
+
 count=0
 for f in "\$LOOP_DIR"/*.txt; do
-  [[ -f "\$f" ]] && send_loop "\$SESSION" "\$f" && count=\$((count + 1))
+  [[ -f "\$f" ]] || continue
+  [[ "\$f" == *"/00-setup.txt" ]] && continue
+  send_loop "\$SESSION" "\$f" && count=\$((count + 1))
 done
 
 echo ""
@@ -1527,50 +1642,51 @@ fi
 
 chmod +x start-loops.sh
 echo "Created start-loops.sh"
+# ─── Auto-commit generated files ──────────────────────────────────────
+GENERATED_FILES=("CLAUDE.md" "LOOPS.md" ".claude/settings.json" ".claude/bootstrap.conf" ".claude/loops/" "start-loops.sh")
+[[ -f ".github/workflows/ci.yml" ]] && GENERATED_FILES+=(".github/workflows/ci.yml")
+
+git add "${GENERATED_FILES[@]}" 2>/dev/null || true
+if ! git diff --cached --quiet 2>/dev/null; then
+  git commit -m "feat: bootstrap claude agent fleet
+
+Generated by claude-agent-bootstrap/setup.sh v3.
+Mode: $MODEL_MODE | Speed: $LOOP_SPEED | Language: $LANG_TYPE" \
+    && COMMIT_MSG="Committed generated files" \
+    || COMMIT_MSG="(commit failed — commit manually)"
+else
+  COMMIT_MSG="(no changes — already up to date)"
+fi
+
+# ─── Start fleet ──────────────────────────────────────────────────────
+echo ""
+echo "Starting agent fleet..."
+echo ""
+FLEET_OK=true
+./start-loops.sh || FLEET_OK=false
+
 # ─── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Bootstrap complete for $REPO_NAME"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "Generated:"
-echo "  .claude/settings.json     (permissions)"
-echo "  .claude/bootstrap.conf    (saved config)"
-echo "  .claude/loops/*.txt       (loop prompts)"
-echo "  CLAUDE.md                 (agent instructions)"
-echo "  LOOPS.md                  (documentation)"
-echo "  start-loops.sh            (tmux launcher)"
-if [[ "$LANG_TYPE" != "generic" ]] && [[ -f ".github/workflows/ci.yml" ]]; then
-echo "  .github/workflows/ci.yml  (CI pipeline)"
-fi
+echo "$COMMIT_MSG"
 echo ""
-echo "Next steps:"
-if [[ "$AUTO_LABELS" == "true" ]]; then
-echo "  1. Run the Label Setup one-shot from LOOPS.md"
+if [[ "$FLEET_OK" == "true" ]]; then
+  echo "Agent fleet started — setup one-shot is creating labels and issues now."
 else
-if [[ "$MODEL_MODE" == "dual" ]]; then
-echo "  1. Create GitHub labels: claude-ready, claude-sonnet, claude-opus, claude-wip, claude-blocked"
-else
-echo "  1. Create GitHub labels: claude-ready, claude-wip, claude-blocked"
-fi
-fi
-echo "  2. Commit generated files"
-if [[ "$LANG_TYPE" != "generic" ]]; then
-echo "  3. Run one-shot tasks from LOOPS.md (Test Bootstrapper, etc.)"
-echo "  4. Start the agent fleet:"
-else
-echo "  3. Start the agent fleet:"
+  echo "Fleet start had issues — see output above. Run ./start-loops.sh manually."
 fi
 echo ""
 if [[ "$MODEL_MODE" == "dual" ]]; then
-echo "     ./start-loops.sh          # start both sessions"
-echo "     ./start-loops.sh sonnet   # Sonnet only"
-echo "     ./start-loops.sh opus     # Opus only"
-echo "     ./start-loops.sh stop     # kill all"
+  echo "  Sonnet: tmux attach -t claude-sonnet"
+  echo "  Opus:   tmux attach -t claude-opus"
+  echo "  Stop:   ./start-loops.sh stop"
 else
-echo "     ./start-loops.sh          # start session"
-echo "     ./start-loops.sh stop     # kill session"
+  echo "  Attach: tmux attach -t claude-agent"
+  echo "  Stop:   ./start-loops.sh stop"
 fi
 echo ""
-echo "  See LOOPS.md for full documentation."
+echo "See LOOPS.md for full documentation."
 echo ""
