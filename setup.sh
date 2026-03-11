@@ -595,6 +595,13 @@ fi)
 - The human should only be involved for decisions and approvals, never for executing steps the agent can do itself.
 - Check your available tools before suggesting manual steps. If a tool exists for the action, use it.
 
+## Comment Signature
+- **Every** GitHub comment, PR description, and PR review reply MUST end with a signature line.
+- Format: \`— <Agent Name> · <model-id>\`
+- Use your agent name from your loop prompt (e.g., "Triage Worker", "TODO Worker", "Lint Guardian", "Build Watchdog", "PR Comment Responder", "Code Quality Sweep").
+- Use your actual model ID (e.g., \`claude-sonnet-4-6\` or \`claude-opus-4-6\`).
+- Example: \`— Lint Guardian · claude-sonnet-4-6\`
+
 ## Verify Chain
 Run this after every change before committing:
 \`\`\`
@@ -1267,6 +1274,38 @@ PROMPT_EOF
   [[ -n "$BUILD_CMD" ]] && LOOP_FILE_COUNT=$((LOOP_FILE_COUNT + 1))
   echo "Created .claude/loops/ ($LOOP_FILE_COUNT prompt files, single mode)"
 fi
+
+# ─── Add signing instructions to loop prompts ─────────────────────────
+for f in .claude/loops/*.txt; do
+  [[ -f "$f" ]] || continue
+  name=$(basename "$f" .txt)
+  [[ "$name" == "00-setup" ]] && continue
+
+  case "$name" in
+    *triage*)       agent="Triage Worker" ;;
+    *sonnet-todo*)  agent="Sonnet TODO Worker" ;;
+    *opus-todo*)    agent="Opus TODO Worker" ;;
+    *todo-worker*)  agent="TODO Worker" ;;
+    *lint*)         agent="Lint Guardian" ;;
+    *build*)        agent="Build Watchdog" ;;
+    *pr-responder*) agent="PR Comment Responder" ;;
+    *quality*)      agent="Code Quality Sweep" ;;
+    *)              agent="Claude Agent" ;;
+  esac
+
+  if [[ "$MODEL_MODE" == "dual" ]]; then
+    case "$name" in
+      0[6-7]-*) model="claude-opus-4-6" ;;
+      *)        model="claude-sonnet-4-6" ;;
+    esac
+  else
+    model="$SINGLE_MODEL"
+  fi
+
+  sed -i "1s/$/ SIGNING: End every GitHub comment and PR body with a footer line: — $agent · $model/" "$f"
+done
+echo "Added signing instructions to loop prompts"
+
 # ─── Generate 00-setup.txt one-shot ───────────────────────────────────
 ISSUE_LABEL="claude-ready"
 [[ "$MODEL_MODE" == "dual" ]] && ISSUE_LABEL="claude-opus"
@@ -1432,11 +1471,11 @@ wait_for_idle() {
 
   while [[ $elapsed -lt $timeout ]]; do
     local pane_text
-    pane_text=$(tmux capture-pane -t "$session" -p -S -5 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' || echo "")
+    pane_text=$(tmux capture-pane -t "$session" -p -S -30 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' || echo "")
 
-    # Claude Code shows ">" on its own line when ready for input
-    if echo "$pane_text" | grep -qE '^\s*>\s*$'; then
-      sleep 1
+    # Claude Code shows "❯" prompt when ready for input
+    if echo "$pane_text" | grep -q '❯'; then
+      sleep 2
       return 0
     fi
 
@@ -1444,8 +1483,8 @@ wait_for_idle() {
     elapsed=$((elapsed + 3))
   done
 
-  echo "WARNING: Timed out waiting for Claude to be ready (${timeout}s)" >&2
-  return 0
+  echo "ERROR: Timed out waiting for Claude to be ready (${timeout}s)" >&2
+  return 1
 }
 
 # --- Helper: send a prompt file to a tmux session ---
@@ -1457,7 +1496,7 @@ send_loop() {
 
   tmux load-buffer -b loop-cmd "$file"
   tmux paste-buffer -b loop-cmd -t "$session"
-  sleep 1
+  sleep 2
   tmux send-keys -t "$session" Enter
   echo "   + $name"
 }
@@ -1478,15 +1517,22 @@ start_sonnet() {
   fi
 
   echo "Starting Sonnet session ($SONNET_SESSION)..."
-  tmux new-session -d -s "$SONNET_SESSION" "claude --model claude-sonnet-4-6"
-  echo "  Waiting for Claude to start..."
-  wait_for_idle "$SONNET_SESSION" 30
+  tmux new-session -d -s "$SONNET_SESSION" "unset CLAUDECODE; claude --model claude-sonnet-4-6"
+  sleep 3  # let tmux pane initialize before polling
+  echo "  Waiting for Claude to start (up to 120s)..."
+  if ! wait_for_idle "$SONNET_SESSION" 120; then
+    echo "FATAL: Sonnet session did not start in time. Check: tmux attach -t $SONNET_SESSION"
+    return 1
+  fi
 
   # Register loop prompts FIRST (each just creates a cron — fast to process).
   # Wait for Claude to be idle between each to prevent queue loss.
   for f in "$LOOP_DIR"/0{1,2,3,4,5}-*.txt; do
     [[ -f "$f" ]] || continue
-    wait_for_idle "$SONNET_SESSION"
+    if ! wait_for_idle "$SONNET_SESSION"; then
+      echo "WARNING: Timed out waiting for idle before $(basename "$f"), skipping remaining loops"
+      break
+    fi
     send_loop "$SONNET_SESSION" "$f"
   done
 
@@ -1494,8 +1540,11 @@ start_sonnet() {
   # All loops are already registered so nothing gets blocked.
   if [[ -f "$LOOP_DIR/00-setup.txt" ]]; then
     echo "  Running setup one-shot..."
-    wait_for_idle "$SONNET_SESSION"
-    send_loop "$SONNET_SESSION" "$LOOP_DIR/00-setup.txt"
+    if wait_for_idle "$SONNET_SESSION"; then
+      send_loop "$SONNET_SESSION" "$LOOP_DIR/00-setup.txt"
+    else
+      echo "WARNING: Timed out before setup one-shot, skipping"
+    fi
   fi
 
   local count=0
@@ -1512,13 +1561,20 @@ start_opus() {
   fi
 
   echo "Starting Opus session ($OPUS_SESSION)..."
-  tmux new-session -d -s "$OPUS_SESSION" "claude --model claude-opus-4-6"
-  echo "  Waiting for Claude to start..."
-  wait_for_idle "$OPUS_SESSION" 30
+  tmux new-session -d -s "$OPUS_SESSION" "unset CLAUDECODE; claude --model claude-opus-4-6"
+  sleep 3  # let tmux pane initialize before polling
+  echo "  Waiting for Claude to start (up to 120s)..."
+  if ! wait_for_idle "$OPUS_SESSION" 120; then
+    echo "FATAL: Opus session did not start in time. Check: tmux attach -t $OPUS_SESSION"
+    return 1
+  fi
 
   for f in "$LOOP_DIR"/0{6,7}-*.txt; do
     [[ -f "$f" ]] || continue
-    wait_for_idle "$OPUS_SESSION"
+    if ! wait_for_idle "$OPUS_SESSION"; then
+      echo "WARNING: Timed out waiting for idle before $(basename "$f"), skipping remaining loops"
+      break
+    fi
     send_loop "$OPUS_SESSION" "$f"
   done
 
@@ -1622,11 +1678,11 @@ wait_for_idle() {
 
   while [[ \$elapsed -lt \$timeout ]]; do
     local pane_text
-    pane_text=\$(tmux capture-pane -t "\$session" -p -S -5 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' || echo "")
+    pane_text=\$(tmux capture-pane -t "\$session" -p -S -30 2>/dev/null | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tr -d '\r' || echo "")
 
-    # Claude Code shows ">" on its own line when ready for input
-    if echo "\$pane_text" | grep -qE '^\s*>\s*\$'; then
-      sleep 1
+    # Claude Code shows "❯" prompt when ready for input
+    if echo "\$pane_text" | grep -q '❯'; then
+      sleep 2
       return 0
     fi
 
@@ -1634,8 +1690,8 @@ wait_for_idle() {
     elapsed=\$((elapsed + 3))
   done
 
-  echo "WARNING: Timed out waiting for Claude to be ready (\${timeout}s)" >&2
-  return 0
+  echo "ERROR: Timed out waiting for Claude to be ready (\${timeout}s)" >&2
+  return 1
 }
 
 # --- Helper: send a prompt file to a tmux session ---
@@ -1647,7 +1703,7 @@ send_loop() {
 
   tmux load-buffer -b loop-cmd "\$file"
   tmux paste-buffer -b loop-cmd -t "\$session"
-  sleep 1
+  sleep 2
   tmux send-keys -t "\$session" Enter
   echo "   + \$name"
 }
@@ -1666,9 +1722,13 @@ if tmux has-session -t "\$SESSION" 2>/dev/null; then
 fi
 
 echo "Starting ${SINGLE_MODEL_NAME} session (\$SESSION)..."
-tmux new-session -d -s "\$SESSION" "claude --model \$MODEL"
-echo "  Waiting for Claude to start..."
-wait_for_idle "\$SESSION" 30
+tmux new-session -d -s "\$SESSION" "unset CLAUDECODE; claude --model \$MODEL"
+sleep 3  # let tmux pane initialize before polling
+echo "  Waiting for Claude to start (up to 120s)..."
+if ! wait_for_idle "\$SESSION" 120; then
+  echo "FATAL: Session did not start in time. Check: tmux attach -t \$SESSION"
+  exit 1
+fi
 
 # Register loop prompts FIRST (each just creates a cron — fast to process).
 # Wait for Claude to be idle between each to prevent queue loss.
@@ -1676,7 +1736,10 @@ count=0
 for f in "\$LOOP_DIR"/*.txt; do
   [[ -f "\$f" ]] || continue
   [[ "\$f" == *"/00-setup.txt" ]] && continue
-  wait_for_idle "\$SESSION"
+  if ! wait_for_idle "\$SESSION"; then
+    echo "WARNING: Timed out waiting for idle before \$(basename "\$f"), skipping remaining loops"
+    break
+  fi
   send_loop "\$SESSION" "\$f" && count=\$((count + 1))
 done
 
@@ -1684,8 +1747,11 @@ done
 # All loops are already registered so nothing gets blocked.
 if [[ -f "\$LOOP_DIR/00-setup.txt" ]]; then
   echo "  Running setup one-shot..."
-  wait_for_idle "\$SESSION"
-  send_loop "\$SESSION" "\$LOOP_DIR/00-setup.txt"
+  if wait_for_idle "\$SESSION"; then
+    send_loop "\$SESSION" "\$LOOP_DIR/00-setup.txt"
+  else
+    echo "WARNING: Timed out before setup one-shot, skipping"
+  fi
 fi
 
 echo ""
