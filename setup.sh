@@ -121,6 +121,31 @@ case "$LOOP_SPEED" in
     MAINTENANCE_INTERVAL="1h"; SWEEP_INTERVAL="2h"
     ;;
 esac
+# ─── Detect agent mode (Tailscale push vs queue-branch polling) ───────
+AGENT_MODE="queue"
+TS_HOSTNAME=""
+TS_TAG="${TS_TAG:-}"  # may be pre-set from sourced bootstrap.conf
+
+if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
+  AGENT_MODE="tailscale"
+  TS_HOSTNAME=$(tailscale status --json 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null \
+    || echo "")
+  echo ""
+  echo "✓ Tailscale detected — using push mode (zero polling)"
+  echo "  Machine: ${TS_HOSTNAME:-<not detected — run: tailscale status>}"
+  TS_TAG="${TS_TAG:-ci}"
+  echo "  Tag: tag:$TS_TAG  (change: delete .claude/bootstrap.conf and re-run, or edit workflows)"
+  # Persist TS_TAG to conf for re-runs (avoids re-prompting)
+  if [[ -f "$BOOTSTRAP_CONF" ]] && ! grep -q "^TS_TAG=" "$BOOTSTRAP_CONF" 2>/dev/null; then
+    echo "TS_TAG=\"$TS_TAG\"" >> "$BOOTSTRAP_CONF"
+  fi
+else
+  TS_TAG="${TS_TAG:-ci}"
+  echo ""
+  echo "! Tailscale not detected — using queue-branch polling mode"
+fi
+
 # ─── Multi-language detection ────────────────────────────────────────
 LANG_TYPE="generic"
 PKG_DIR=""
@@ -1306,6 +1331,416 @@ for f in .claude/loops/*.txt; do
 done
 echo "Added signing instructions to loop prompts"
 
+# ─── Generate agent event handling (Tailscale push or queue branch) ───
+if [[ "$AGENT_MODE" == "tailscale" ]]; then
+
+  # ── Webhook secret ──
+  WEBHOOK_SECRET_FILE="$HOME/.claude/agent-webhook.secret"
+  if [[ ! -f "$WEBHOOK_SECRET_FILE" ]]; then
+    if [[ -t 0 ]] && [[ "$USE_DEFAULTS" == "false" ]]; then
+      echo ""
+      echo "  No webhook secret found at $WEBHOOK_SECRET_FILE"
+      read -rp "  Paste existing AGENT_WEBHOOK_SECRET (Enter to generate new): " _existing_secret
+      if [[ -n "$_existing_secret" ]]; then
+        echo "$_existing_secret" > "$WEBHOOK_SECRET_FILE"
+        chmod 600 "$WEBHOOK_SECRET_FILE"
+        echo "  Using provided secret"
+      else
+        python3 -c "import secrets; print(secrets.token_hex(32))" > "$WEBHOOK_SECRET_FILE"
+        chmod 600 "$WEBHOOK_SECRET_FILE"
+        echo "  Generated new webhook secret"
+      fi
+    else
+      python3 -c "import secrets; print(secrets.token_hex(32))" > "$WEBHOOK_SECRET_FILE"
+      chmod 600 "$WEBHOOK_SECRET_FILE"
+      echo "Generated webhook secret: $WEBHOOK_SECRET_FILE"
+    fi
+  else
+    echo "Webhook secret: reusing $WEBHOOK_SECRET_FILE"
+  fi
+  AGENT_WEBHOOK_SECRET=$(cat "$WEBHOOK_SECRET_FILE")
+
+  # ── GHA workflows (single-quoted heredoc preserves ${{ }}; sed substitutes machine/tag) ──
+  mkdir -p .github/workflows
+
+  cat > .github/workflows/agent-webhook-issue.yml << 'YAML_EOF'
+name: "Trigger Claude — Issue"
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  trigger:
+    if: contains(fromJson('["claude-ready","claude-sonnet","claude-opus"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:__TS_TAG__
+
+      - name: Send event to local agent
+        env:
+          SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          LABEL: ${{ github.event.label.name }}
+          NUMBER: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -sf --retry 3 --retry-delay 2 -X POST \
+            "http://__TS_HOSTNAME__:9876/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Agent-Secret: $SECRET" \
+            -d "$(jq -n \
+              --arg type "issue" \
+              --arg label "$LABEL" \
+              --argjson number "$NUMBER" \
+              --arg title "$TITLE" \
+              --arg body "$BODY" \
+              --arg repo "$REPO" \
+              '{type:$type,label:$label,number:$number,title:$title,body:$body,repo:$repo}')"
+YAML_EOF
+
+  cat > .github/workflows/agent-webhook-pr-comment.yml << 'YAML_EOF'
+name: "Trigger Claude — PR Comment"
+
+on:
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger:
+    if: |
+      !contains(github.event.comment.user.login, '[bot]') &&
+      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null)
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:__TS_TAG__
+
+      - name: Send event to local agent
+        env:
+          SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -sf --retry 3 --retry-delay 2 -X POST \
+            "http://__TS_HOSTNAME__:9876/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Agent-Secret: $SECRET" \
+            -d "$(jq -n \
+              --arg type "pr_comment" \
+              --argjson pr_number "$PR_NUMBER" \
+              --arg comment_body "$COMMENT_BODY" \
+              --arg comment_author "$COMMENT_AUTHOR" \
+              --arg pr_branch "$PR_BRANCH" \
+              --arg repo "$REPO" \
+              '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo}')"
+YAML_EOF
+
+  sed -i "s|__TS_HOSTNAME__|${TS_HOSTNAME}|g; s|__TS_TAG__|${TS_TAG}|g" \
+    .github/workflows/agent-webhook-issue.yml \
+    .github/workflows/agent-webhook-pr-comment.yml
+  echo "Created .github/workflows/agent-webhook-issue.yml"
+  echo "Created .github/workflows/agent-webhook-pr-comment.yml"
+
+  # ── webhook-receiver.py (generated via Python to avoid heredoc escaping) ──
+  if [[ "$MODEL_MODE" == "dual" ]]; then
+    RECV_SONNET="claude-sonnet"
+    RECV_OPUS="claude-opus"
+  else
+    RECV_SONNET="claude-agent"
+    RECV_OPUS="claude-agent"
+  fi
+
+  RECEIVER_REPO="${GITHUB_USER}/${GITHUB_REPO}" \
+  RECEIVER_SONNET="${RECV_SONNET}" \
+  RECEIVER_OPUS="${RECV_OPUS}" \
+  RECEIVER_VERIFY="${VERIFY_CHAIN}" \
+  python3 - << 'PYEOF'
+import os
+
+repo   = os.environ['RECEIVER_REPO']
+sonnet = os.environ['RECEIVER_SONNET']
+opus   = os.environ['RECEIVER_OPUS']
+verify = os.environ['RECEIVER_VERIFY']
+
+code = r'''#!/usr/bin/env python3
+"""Claude agent webhook receiver — generated by claude-agent-bootstrap/setup.sh"""
+import http.server, json, os, subprocess, threading, logging, sys
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
+
+REPO           = '__REPO__'
+SONNET_SESSION = '__SONNET__'
+OPUS_SESSION   = '__OPUS__'
+VERIFY_CHAIN   = '__VERIFY__'
+PORT           = 9876
+
+try:
+    SECRET = open(os.path.expanduser('~/.claude/agent-webhook.secret')).read().strip()
+except FileNotFoundError:
+    logging.error('Secret file not found: ~/.claude/agent-webhook.secret')
+    logging.error('Run: python3 -c "import secrets; print(secrets.token_hex(32))" > ~/.claude/agent-webhook.secret')
+    sys.exit(1)
+
+
+def shell_escape_dq(s):
+    """Escape for embedding in a bash double-quoted shell context."""
+    return str(s).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+
+    def do_POST(self):
+        if self.headers.get('X-Agent-Secret', '') != SECRET:
+            self.send_response(403); self.end_headers()
+            logging.warning('Rejected: bad secret')
+            return
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        self.send_response(200); self.end_headers()
+        try:
+            threading.Thread(target=dispatch, args=(json.loads(body),), daemon=True).start()
+        except json.JSONDecodeError as e:
+            logging.error(f'Bad JSON: {e}')
+
+
+def dispatch(p):
+    t = p.get('type')
+    logging.info(f'Event: {t}  repo={p.get("repo", "?")}')
+    if t == 'issue':
+        label   = p.get('label', 'claude-ready')
+        model   = 'claude-opus-4-6' if label == 'claude-opus' else 'claude-sonnet-4-6'
+        session = OPUS_SESSION if label == 'claude-opus' else SONNET_SESSION
+        prompt  = issue_prompt(p, model)
+    elif t == 'pr_comment':
+        model   = 'claude-sonnet-4-6'
+        session = SONNET_SESSION
+        prompt  = pr_comment_prompt(p)
+    else:
+        logging.warning(f'Unknown event type: {t}')
+        return
+    escaped = shell_escape_dq(prompt)
+    cmd = f'claude --model {model} --print "{escaped}"'
+    result = subprocess.run(['tmux', 'new-window', '-t', session, cmd])
+    if result.returncode == 0:
+        logging.info(f'Spawned {model} in {session}')
+    else:
+        logging.error(f'Failed to open tmux window in {session} — is the session running?')
+
+
+def issue_prompt(p, model):
+    number = p.get('number', '?')
+    title  = p.get('title', '(no title)')
+    body   = p.get('body') or '(no body)'
+    repo_s = REPO.split('/')[-1]
+    owner  = REPO.split('/')[0]
+    verify = VERIFY_CHAIN or 'run your test suite'
+    return f"""You are a TODO Worker for {REPO}. Process this single issue then exit — do NOT loop.
+
+Issue #{number}: {title}
+
+{body}
+
+Steps:
+1. git worktree add /tmp/{repo_s}-issue-{number} -b claude/issue-{number} origin/main
+2. Implement the requested change
+3. Verify: {verify}
+4. git commit -m "feat: <summary>" && git push -u origin claude/issue-{number}
+5. mcp__github__create_pull_request (owner: {owner}, repo: {repo_s}, head: claude/issue-{number}, base: main, title: "<summary>", body: "Closes #{number}")
+6. mcp__github__add_issue_comment (owner: {owner}, repo: {repo_s}, issue_number: {number}, body: "PR: <link>")
+7. git worktree remove /tmp/{repo_s}-issue-{number}
+8. If stuck after 3 attempts: add label claude-blocked
+
+Always use MCP tools directly. Never force push.
+— TODO Worker · {model}"""
+
+
+def pr_comment_prompt(p):
+    pr_num  = p.get('pr_number', '?')
+    branch  = p.get('pr_branch') or 'unknown'
+    comment = p.get('comment_body', '(no comment)')
+    author  = p.get('comment_author', 'unknown')
+    repo_s  = REPO.split('/')[-1]
+    owner   = REPO.split('/')[0]
+    verify  = VERIFY_CHAIN or 'run your test suite'
+    return f"""You are a PR Comment Responder for {REPO}. Respond to this PR comment then exit — do NOT loop.
+
+PR #{pr_num} (branch: {branch})
+Comment by {author}:
+{comment}
+
+Steps:
+1. mcp__github__pull_request_read (owner: {owner}, repo: {repo_s}, pull_number: {pr_num}) to understand context
+2. If simple fix (typo, rename, small change): git worktree from {branch}, make change, verify: {verify}, push to {branch}
+3. Reply "Addressed in latest commit." via mcp__github__add_issue_comment or mcp__github__add_reply_to_pull_request_comment
+4. If complex rework: reply "Escalating to opus session" and add label claude-opus to the PR
+5. git worktree remove when done
+
+Never force push.
+— PR Comment Responder · claude-sonnet-4-6"""
+
+
+if __name__ == '__main__':
+    server = http.server.HTTPServer(('', PORT), Handler)
+    logging.info(f'Listening on :{PORT}  repo={REPO}  sonnet={SONNET_SESSION}  opus={OPUS_SESSION}')
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logging.info('Shutting down')
+'''
+
+code = (code
+    .replace('__REPO__',   repo)
+    .replace('__SONNET__', sonnet)
+    .replace('__OPUS__',   opus)
+    .replace('__VERIFY__', verify))
+
+with open('webhook-receiver.py', 'w') as f:
+    f.write(code)
+print('Created webhook-receiver.py')
+PYEOF
+
+else
+  # ── Queue mode: GHA writes JSON to claude-queue branch ──
+  mkdir -p .github/workflows
+
+  cat > .github/workflows/agent-queue-issue.yml << 'YAML_EOF'
+name: "Queue Claude — Issue"
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  queue:
+    if: contains(fromJson('["claude-ready","claude-sonnet","claude-opus"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write to queue branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_LABEL: ${{ github.event.label.name }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          FILENAME="issue-${ISSUE_NUMBER}-${TIMESTAMP}.json"
+          CONTENT=$(jq -n \
+            --arg type "issue" \
+            --arg label "$ISSUE_LABEL" \
+            --argjson number "$ISSUE_NUMBER" \
+            --arg title "$ISSUE_TITLE" \
+            --arg body "$ISSUE_BODY" \
+            --arg repo "$REPO" \
+            --arg queued_at "$TIMESTAMP" \
+            '{type:$type,label:$label,number:$number,title:$title,body:$body,repo:$repo,queued_at:$queued_at}')
+          CONTENT_B64=$(echo "$CONTENT" | base64 -w 0)
+          curl -sf -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/pending/${FILENAME}" \
+            -d "{\"message\":\"queue: issue #${ISSUE_NUMBER}\",\"content\":\"${CONTENT_B64}\",\"branch\":\"claude-queue\"}"
+YAML_EOF
+
+  cat > .github/workflows/agent-queue-pr-comment.yml << 'YAML_EOF'
+name: "Queue Claude — PR Comment"
+
+on:
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+jobs:
+  queue:
+    if: |
+      !contains(github.event.comment.user.login, '[bot]') &&
+      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Write to queue branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          FILENAME="pr-${PR_NUMBER}-${TIMESTAMP}.json"
+          CONTENT=$(jq -n \
+            --arg type "pr_comment" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg comment_body "$COMMENT_BODY" \
+            --arg comment_author "$COMMENT_AUTHOR" \
+            --arg pr_branch "$PR_BRANCH" \
+            --arg repo "$REPO" \
+            --arg queued_at "$TIMESTAMP" \
+            '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo,queued_at:$queued_at}')
+          CONTENT_B64=$(echo "$CONTENT" | base64 -w 0)
+          curl -sf -X PUT \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/pending/${FILENAME}" \
+            -d "{\"message\":\"queue: pr #${PR_NUMBER} comment\",\"content\":\"${CONTENT_B64}\",\"branch\":\"claude-queue\"}"
+YAML_EOF
+
+  echo "Created .github/workflows/agent-queue-issue.yml"
+  echo "Created .github/workflows/agent-queue-pr-comment.yml"
+
+  # Create claude-queue orphan branch
+  echo "Setting up claude-queue branch..."
+  if git ls-remote --heads origin claude-queue 2>/dev/null | grep -q "refs/heads/claude-queue"; then
+    echo "  claude-queue branch already exists"
+  else
+    _queue_tmp="/tmp/${REPO_NAME}-queue-$$"
+    if git worktree add "$_queue_tmp" --orphan claude-queue --quiet 2>/dev/null; then
+      mkdir -p "$_queue_tmp/pending" "$_queue_tmp/processed"
+      touch "$_queue_tmp/pending/.gitkeep" "$_queue_tmp/processed/.gitkeep"
+      git -C "$_queue_tmp" add . --quiet
+      git -C "$_queue_tmp" commit -m "chore: initialize claude-queue branch" --quiet
+      git -C "$_queue_tmp" push -u origin claude-queue --quiet \
+        && echo "  claude-queue branch created" \
+        || echo "  WARNING: push failed — run: git push origin claude-queue"
+      git worktree remove "$_queue_tmp" --force 2>/dev/null || rm -rf "$_queue_tmp"
+    else
+      echo "  NOTE: Create queue branch manually (git >= 2.37 required for auto-create):"
+      echo "    git checkout --orphan claude-queue && git rm -rf ."
+      echo "    mkdir -p pending processed && touch pending/.gitkeep processed/.gitkeep"
+      echo "    git add . && git commit -m 'chore: init queue' && git push origin claude-queue && git checkout -"
+    fi
+  fi
+
+fi
+
+# ─── Update .gitignore (both modes) ───────────────────────────────────
+# webhook-receiver.py contains baked-in secrets and should never be committed
+{
+  [[ -f ".gitignore" ]] || touch ".gitignore"
+  grep -q "^webhook-receiver\.py$" .gitignore || echo "webhook-receiver.py" >> .gitignore
+}
+
 # ─── Generate 00-setup.txt one-shot ───────────────────────────────────
 ISSUE_LABEL="claude-ready"
 [[ "$MODEL_MODE" == "dual" ]] && ISSUE_LABEL="claude-opus"
@@ -1767,9 +2202,85 @@ fi
 
 chmod +x start-loops.sh
 echo "Created start-loops.sh"
+
+# ─── Inject webhook receiver startup into start-loops.sh ──────────────
+python3 - << 'INJECT_EOF'
+import re
+
+with open('start-loops.sh', 'r') as f:
+    content = f.read()
+
+receiver_func = r'''
+# --- Start webhook receiver (if present) ---
+start_receiver() {
+  [[ -f "webhook-receiver.py" ]] || return 0
+  if ! command -v python3 &>/dev/null; then
+    echo "WARNING: python3 not found — webhook-receiver.py not started"
+    return 0
+  fi
+  local recv_session="claude-receiver"
+  if tmux has-session -t "$recv_session" 2>/dev/null; then
+    echo "Webhook receiver already running ($recv_session)"
+    return 0
+  fi
+  echo "Starting webhook receiver..."
+  tmux new-session -d -s "$recv_session" "cd \"$REPO_ROOT\" && python3 webhook-receiver.py"
+  sleep 1
+  echo "  Receiver running: tmux attach -t $recv_session"
+}
+
+'''
+
+# Insert start_receiver function before first "Start * session" comment
+content = re.sub(
+    r'(# --- Start (?:Sonnet )?session ---)',
+    receiver_func + r'\1',
+    content,
+    count=1
+)
+
+# Add start_receiver call in 'all)' case (dual mode)
+if '  all)\n    start_sonnet' in content:
+    content = content.replace(
+        '  all)\n    start_sonnet',
+        '  all)\n    start_receiver\n    echo ""\n    start_sonnet',
+        1
+    )
+else:
+    # Single mode: add before the "Starting X session" echo
+    content = re.sub(
+        r'\n(echo "Starting [A-Za-z]+ session)',
+        '\nstart_receiver\necho ""\n\\1',
+        content,
+        count=1
+    )
+
+# Kill receiver in stop commands
+content = content.replace(
+    'echo "Stopping agent sessions..."',
+    'echo "Stopping agent sessions..."\n  tmux kill-session -t "claude-receiver" 2>/dev/null && echo "  Killed claude-receiver" || true',
+    1
+)
+content = content.replace(
+    'echo "Stopping agent session..."',
+    'echo "Stopping agent session..."\n  tmux kill-session -t "claude-receiver" 2>/dev/null && echo "  Killed claude-receiver" || true',
+    1
+)
+
+with open('start-loops.sh', 'w') as f:
+    f.write(content)
+print('Updated start-loops.sh with webhook receiver support')
+INJECT_EOF
+
 # ─── Auto-commit generated files ──────────────────────────────────────
 GENERATED_FILES=("CLAUDE.md" "LOOPS.md" ".claude/settings.json" ".claude/bootstrap.conf" ".claude/loops/" "start-loops.sh")
 [[ -f ".github/workflows/ci.yml" ]] && GENERATED_FILES+=(".github/workflows/ci.yml")
+if [[ "$AGENT_MODE" == "tailscale" ]]; then
+  GENERATED_FILES+=(".github/workflows/agent-webhook-issue.yml" ".github/workflows/agent-webhook-pr-comment.yml")
+else
+  GENERATED_FILES+=(".github/workflows/agent-queue-issue.yml" ".github/workflows/agent-queue-pr-comment.yml")
+fi
+[[ -f ".gitignore" ]] && GENERATED_FILES+=(".gitignore")
 
 git add "${GENERATED_FILES[@]}" 2>/dev/null || true
 if ! git diff --cached --quiet 2>/dev/null; then
@@ -1815,3 +2326,40 @@ fi
 echo ""
 echo "See LOOPS.md for full documentation."
 echo ""
+if [[ "$AGENT_MODE" == "tailscale" ]]; then
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Event mode: Tailscale Push (zero polling)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "  Add 3 secrets to GitHub repo Settings → Secrets → Actions:"
+  echo "    TS_OAUTH_CLIENT_ID   — Tailscale OAuth client ID"
+  echo "    TS_OAUTH_SECRET      — Tailscale OAuth client secret"
+  echo "    AGENT_WEBHOOK_SECRET — ${AGENT_WEBHOOK_SECRET}"
+  echo ""
+  echo "  Machine baked into workflows: ${TS_HOSTNAME:-<check tailscale status>}"
+  echo "  Tailscale tag: tag:${TS_TAG}"
+  echo ""
+  echo "  One-time Tailscale setup (if not done):"
+  echo "    1. tailscale.com → Access Controls → add to tagOwners: { \"tag:${TS_TAG}\": [] }"
+  echo "    2. tailscale.com → Settings → OAuth clients → create with tag:${TS_TAG}, scope: devices:core:write"
+  echo ""
+  echo "  Then:"
+  echo "    git push            # activates GHA webhooks"
+  echo "    ./start-loops.sh    # starts receiver + Claude sessions"
+  echo ""
+  echo "  Label any issue 'claude-ready' — GHA fires instantly, no polling."
+  echo ""
+else
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Event mode: Queue Branch (no secrets needed)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "  No secrets required — uses built-in GITHUB_TOKEN."
+  echo ""
+  echo "  Then:"
+  echo "    git push            # activates queue workflows"
+  echo "    ./start-loops.sh    # starts Claude sessions"
+  echo ""
+  echo "  Events are written to claude-queue/pending/ on GitHub."
+  echo ""
+fi
