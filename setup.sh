@@ -1711,6 +1711,7 @@ jobs:
           TITLE: ${{ github.event.issue.title }}
           BODY: ${{ github.event.issue.body }}
           REPO: ${{ github.repository }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels.*.name) }}
         run: |
           curl -sf --retry 3 --retry-delay 2 -X POST \
             "http://__TS_HOSTNAME__:9876/webhook" \
@@ -1723,7 +1724,8 @@ jobs:
               --arg title "$TITLE" \
               --arg body "$BODY" \
               --arg repo "$REPO" \
-              '{type:$type,label:$label,number:$number,title:$title,body:$body,repo:$repo}')"
+              --arg issue_labels "$ISSUE_LABELS" \
+              '{type:$type,label:$label,number:$number,title:$title,body:$body,repo:$repo,issue_labels:$issue_labels}')"
 YAML_EOF
 
   cat > .github/workflows/agent-webhook-pr-comment.yml << 'YAML_EOF'
@@ -1908,12 +1910,23 @@ def dispatch(p):
                 return
 
     # Dedup: prevent multiple workers for the same event
-    key = (t, p.get('label', ''), p.get('number') or p.get('pr_number', ''))
+    # For issues, key is label-agnostic — only one worker per issue regardless of which label triggered it
+    if t == 'issue':
+        key = (t, p.get('number', ''))
+    else:
+        key = (t, p.get('label', ''), p.get('number') or p.get('pr_number', ''))
     with _in_flight_lock:
         if key in _in_flight:
             logging.info(f'Skipping {key} — already in flight')
             return
         _in_flight.add(key)
+
+    # claude-wip label guard: if the issue already has claude-wip, another worker claimed it
+    if t == 'issue' and p.get('label') in ('claude-sonnet', 'claude-opus') and 'claude-wip' in p.get('issue_labels', ''):
+        logging.info(f'Skipping issue #{p.get("number")} — already has claude-wip label')
+        with _in_flight_lock:
+            _in_flight.discard(key)
+        return
 
     if t == 'issue':
         label = p.get('label', 'claude-ready')
@@ -1949,7 +1962,7 @@ def dispatch(p):
     cmd = f'claude --model {model} --print "{escaped}"'
     # Use tmux wait-for + remain-on-exit to detect when the worker finishes.
     # This lets us expire the dedup key immediately instead of a fixed 30m timer.
-    window_id = f'worker-{key[2]}-{threading.get_ident() % 10000}'
+    window_id = f'worker-{key[-1]}-{threading.get_ident() % 10000}'
     spawn = subprocess.run([
         'tmux', 'new-window', '-d', '-t', session,
         '-n', window_id,
@@ -1961,6 +1974,8 @@ def dispatch(p):
         def _wait_and_expire():
             subprocess.run(['tmux', 'wait-for', window_id], timeout=3600,
                            capture_output=True)
+            if t == 'issue':
+                time.sleep(60)  # cooldown: prevent rapid re-dispatch for same issue
             with _in_flight_lock:
                 _in_flight.discard(key)
             logging.info(f'Worker done, released {key}')
@@ -2023,6 +2038,10 @@ Issue #{number}: {title}
 {body}
 
 Steps:
+0. DEDUP CHECK: Before doing anything, check if a PR already exists for this issue.
+   Use mcp__github__list_pull_requests(owner: {owner}, repo: {repo_s}, state: "open", head: "{owner}:claude/issue-{number}").
+   Also use mcp__github__search_pull_requests(q: "repo:{REPO} is:pr is:open Closes #{number} OR Fixes #{number}") to catch PRs with non-standard branch names.
+   If ANY open PR already exists for this issue, exit immediately — another worker already handled it. Do NOT create a duplicate PR.
 1. Set the issue labels to exactly {claim_labels} via mcp__github__issue_write(method: "update", owner: {owner}, repo: {repo_s}, issue_number: {number}, labels: {claim_labels}) — this REPLACES all labels, removing any stale claude-ready.
 2. EPIC CHECK: Read the issue title and body carefully. If this issue describes a **large project or epic** with multiple sub-tasks (look for: checklist of features, "phase 1/2/3", multiple distinct deliverables, explicit sub-task lists), then follow the EPIC PATH below. Otherwise, follow the REGULAR PATH.
 
