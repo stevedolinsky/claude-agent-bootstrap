@@ -586,6 +586,8 @@ $(if [[ -z "$INSTALL_CMD" && -z "$LINT_CMD" && -z "$BUILD_CMD" && -z "$TEST_CMD"
 - Sub-task branches are created from the epic branch (not main): \`git worktree add /tmp/$REPO_NAME-<subtask> -b claude/<subtask> claude/epic-<name>\`
 - Sub-task PRs target the epic branch as base (not main)
 - When all sub-tasks are merged into the epic branch, create a single PR from epic branch > main for human review
+- After breaking an epic into sub-tasks, add the \`claude-epic-done\` label to the epic issue (alongside the model label). This signals catch-up loops to skip it — the epic has been decomposed and should not be re-processed.
+- Labels after epic breakdown: \`["claude-opus", "claude-epic-done"]\` (or \`["claude-epic-done"]\` in single mode)
 
 ## Agent Backlog Convention
 $(if [[ "$MODEL_MODE" == "dual" ]]; then
@@ -629,12 +631,24 @@ fi)
 - The human should only be involved for decisions and approvals, never for executing steps the agent can do itself.
 - Check your available tools before suggesting manual steps. If a tool exists for the action, use it.
 
-## Comment Signature
-- **Every** GitHub comment, PR description, and PR review reply MUST end with a signature line.
-- Format: \`— <Agent Name> · <model-id>\`
+## Comment Signature (SAFETY-CRITICAL)
+**WARNING:** Without the \`<!-- claude-agent -->\` marker, your comment triggers an infinite self-reply loop. This has caused production incidents (14 self-replies on a single PR). The marker is NON-NEGOTIABLE.
+
+- **Every** GitHub comment, PR description, and PR review reply MUST end with a signature line followed by the bot marker.
+- Every comment body MUST end with \`<!-- claude-agent -->\` on the last line, after the signature.
+- Required format (exact):
+\`\`\`
+<your response text>
+
+— <Agent Name> · <model-id>
+<!-- claude-agent -->
+\`\`\`
 - Use your agent name from your loop prompt (e.g., "Triage Worker", "TODO Worker", "Lint Guardian", "Build Watchdog", "PR Comment Responder", "Code Quality Sweep").
 - Use your actual model ID (e.g., \`claude-sonnet-4-6\` or \`claude-opus-4-6\`).
-- Example: \`— Lint Guardian · claude-sonnet-4-6\`
+- Example: \`Addressed in latest commit.\\n\\n— Lint Guardian · claude-sonnet-4-6\\n<!-- claude-agent -->\`
+- **Self-reply guard (dual detection):** A comment is a bot reply if it contains \`<!-- claude-agent -->\` OR ends with \`· claude-sonnet-\` / \`· claude-opus-\` (visible signature). Skip both — do not respond.
+- **Closed PR guard:** Never comment on closed or merged PRs. Check PR state before responding.
+- **claude-blocked guard:** If a PR has the \`claude-blocked\` label, do not comment or take action on it.
 
 ## Verify Chain
 Run this after every change before committing:
@@ -1181,7 +1195,7 @@ LOOPS_EOF
 
 ### PR Comment Responder
 \`\`\`
-/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages. If none, stop. 4) Assess each comment's complexity: if the requested change is a simple fix (typo, rename, small tweak), handle it. If the comment requests a complex rework, reply acknowledging and add label \`claude-opus\` to the PR for escalation to the Opus session. 5) For changes you handle (max 3): create worktree from PR branch, make the change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 6) Reply to comments: "Addressed in latest commit." 7) If the comment asks you to run something and you have an MCP tool for it, execute it directly. 8) Clean up worktree. Never force push.
+/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages, comments containing \`<!-- claude-agent -->\`, and comments ending with \`· claude-sonnet-\` or \`· claude-opus-\` (bot self-replies). Skip closed/merged PRs. Skip PRs with \`claude-blocked\` label. CIRCUIT BREAKER: if 3+ consecutive latest comments on a PR match the bot signature pattern, skip that PR entirely. If none remain, stop. 4) Assess each comment's complexity: if the requested change is a simple fix (typo, rename, small tweak), handle it. If the comment requests a complex rework, reply acknowledging and add label \`claude-opus\` to the PR for escalation to the Opus session. 5) For changes you handle (max 3): create worktree from PR branch, make the change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 6) Reply to comments: "Addressed in latest commit." — your reply MUST end with EXACTLY: \`\\n\\n— PR Comment Responder · claude-sonnet-4-6\\n<!-- claude-agent -->\`. The marker is REQUIRED to prevent self-reply loops. 7) If the comment asks you to run something and you have an MCP tool for it, execute it directly. 8) Clean up worktree. Never force push.
 \`\`\`
 
 ---
@@ -1294,7 +1308,7 @@ LOOPS_EOF
 
 ### PR Comment Responder
 \`\`\`
-/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages. If none, stop. 4) For changes you can handle (max 3): create worktree from PR branch, make the change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 5) Reply to comments: "Addressed in latest commit." 6) If the comment asks you to run something and you have an MCP tool for it, execute it directly. 7) If truly stuck after 3 attempts, add \`claude-blocked\` label to the PR and reply explaining the difficulty. 8) Clean up worktree. Never force push.
+/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages, comments containing \`<!-- claude-agent -->\`, and comments ending with \`· claude-sonnet-\` or \`· claude-opus-\` (bot self-replies). Skip closed/merged PRs. Skip PRs with \`claude-blocked\` label. CIRCUIT BREAKER: if 3+ consecutive latest comments on a PR match the bot signature pattern, skip that PR entirely. If none remain, stop. 4) For changes you can handle (max 3): create worktree from PR branch, make the change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 5) Reply to comments: "Addressed in latest commit." — your reply MUST end with EXACTLY: \`\\n\\n— PR Comment Responder · claude-sonnet-4-6\\n<!-- claude-agent -->\`. The marker is REQUIRED to prevent self-reply loops. 6) If the comment asks you to run something and you have an MCP tool for it, execute it directly. 7) If truly stuck after 3 attempts, add \`claude-blocked\` label to the PR and reply explaining the difficulty. 8) Clean up worktree. Never force push.
 \`\`\`
 
 ### Code Quality Sweep
@@ -1496,11 +1510,11 @@ PROMPT_EOF
   # Event-driven loops: skip in Tailscale mode (webhook receiver handles these)
   if [[ "$AGENT_MODE" != "tailscale" ]]; then
     cat > .claude/loops/05-pr-responder.txt << PROMPT_EOF
-/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages. If none, stop. 4) Assess each comment's complexity: if the requested change is a simple fix (typo, rename, small tweak, adding a check), handle it. If the comment requests a complex rework (redesign component, rethink approach, add substantial new logic), reply acknowledging and add a comment: "This requires deeper changes — escalating to opus session" and add label \`claude-opus\` to the PR. 5) For changes you handle (max 3): create worktree from PR branch, make the requested change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 6) For inline comments: reply via mcp__github__add_reply_to_pull_request_comment. For general comments: reply via mcp__github__add_issue_comment. Body: "Addressed in latest commit." 7) If the comment asks you to run something (SQL, deploy, etc.) and you have an MCP tool for it, execute it directly. 8) Clean up worktree. Never force push.
+/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages, comments containing \`<!-- claude-agent -->\`, and comments ending with \`· claude-sonnet-\` or \`· claude-opus-\` (bot self-replies). Skip closed/merged PRs. Skip PRs with \`claude-blocked\` label. CIRCUIT BREAKER: if 3+ consecutive latest comments on a PR match the bot signature pattern, skip that PR entirely. If none remain, stop. 4) Assess each comment's complexity: if the requested change is a simple fix (typo, rename, small tweak, adding a check), handle it. If the comment requests a complex rework (redesign component, rethink approach, add substantial new logic), reply acknowledging and add a comment: "This requires deeper changes — escalating to opus session" and add label \`claude-opus\` to the PR. 5) For changes you handle (max 3): create worktree from PR branch, make the requested change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 6) For inline comments: reply via mcp__github__add_reply_to_pull_request_comment. For general comments: reply via mcp__github__add_issue_comment. Your reply MUST end with EXACTLY: \`\\n\\n— PR Comment Responder · claude-sonnet-4-6\\n<!-- claude-agent -->\`. The marker is REQUIRED to prevent self-reply loops. 7) If the comment asks you to run something (SQL, deploy, etc.) and you have an MCP tool for it, execute it directly. 8) Clean up worktree. Never force push.
 PROMPT_EOF
 
     cat > .claude/loops/06-opus-todo.txt << PROMPT_EOF
-/loop $WORKER_INTERVAL You are an Opus TODO Worker loop for ${GITHUB_USER}/${GITHUB_REPO}. You handle COMPLEX tasks that require deep reasoning. On each iteration: 1) Check GitHub Issues labeled \`claude-opus\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-opus"]). 2) ALSO check issues with BOTH \`claude-wip\` AND \`claude-opus\` labels for new user comments — use mcp__github__issue_read with method "get_comments". 3) ALSO check for escalated PRs via mcp__github__search_pull_requests (query: "is:open is:pr label:claude-opus repo:${GITHUB_USER}/${GITHUB_REPO}") — these are PRs where Sonnet's PR Comment Responder hit something too complex and added the \`claude-opus\` label. 4) If nothing found, stop. 5) Pick ONE item (prefer escalated PRs > issues > inline TODOs). 6) For issues: set labels to exactly ["claude-wip", "claude-opus"] via mcp__github__issue_write(method: "update", labels: ["claude-wip", "claude-opus"]) — this REPLACES all labels, removing any stale claude-ready. 7) Check if the issue is an epic (describes a large project with sub-tasks). If yes: create the epic branch \`claude/epic-<name>\`, break down into sub-issues (label each \`claude-opus\` or \`claude-sonnet\` based on sub-task complexity), and create them via mcp__github__issue_write. 8) For regular issues: check if it's a sub-task of a larger epic. If yes: create worktree from the epic branch, PR against that branch. If no: create worktree from origin/main, PR against main. 9) Implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 10) Create a PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: epic-branch-or-main) with title from the issue and body that says "Closes #N" plus a thorough summary of the approach and changes. 11) Comment on the issue with the PR link via mcp__github__add_issue_comment. 12) For escalated PRs: create worktree from the PR branch, address the complex review feedback, verify, commit+push, reply to the comments. 13) Clean up worktree. If stuck after 3 attempts: set labels to ["claude-blocked"]. 14) IMPORTANT: Always use available MCP tools directly. One item per iteration. Never force push.
+/loop $WORKER_INTERVAL You are an Opus TODO Worker loop for ${GITHUB_USER}/${GITHUB_REPO}. You handle COMPLEX tasks that require deep reasoning. On each iteration: 1) Check GitHub Issues labeled \`claude-opus\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-opus"]). 2) ALSO check issues with BOTH \`claude-wip\` AND \`claude-opus\` labels for new user comments — use mcp__github__issue_read with method "get_comments". 3) ALSO check for escalated PRs via mcp__github__search_pull_requests (query: "is:open is:pr label:claude-opus repo:${GITHUB_USER}/${GITHUB_REPO}") — these are PRs where Sonnet's PR Comment Responder hit something too complex and added the \`claude-opus\` label. 4) Skip any issues that have the \`claude-epic-done\` label — these epics have already been broken down. 5) If nothing found, stop. 6) Pick ONE item (prefer escalated PRs > issues > inline TODOs). 7) For issues: set labels to exactly ["claude-wip", "claude-opus"] via mcp__github__issue_write(method: "update", labels: ["claude-wip", "claude-opus"]) — this REPLACES all labels, removing any stale claude-ready. 8) Check if the issue is an epic (describes a large project with sub-tasks). If yes: create the epic branch \`claude/epic-<name>\`, break down into sub-issues (label each \`claude-opus\` or \`claude-sonnet\` based on sub-task complexity), create them via mcp__github__issue_write, then set the EPIC issue labels to ["claude-opus", "claude-epic-done"] — this marks the epic as decomposed so it is never re-processed. Comment on the epic: "Epic broken down into N sub-tasks. Sub-task issues created." Then move to next iteration — do NOT implement the epic itself. 9) For regular issues: check if it's a sub-task of a larger epic. If yes: create worktree from the epic branch, PR against that branch. If no: create worktree from origin/main, PR against main. 10) Implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 11) Create a PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: epic-branch-or-main) with title from the issue and body that says "Closes #N" plus a thorough summary of the approach and changes. 12) Comment on the issue with the PR link via mcp__github__add_issue_comment. 13) For escalated PRs: create worktree from the PR branch, address the complex review feedback, verify, commit+push, reply to the comments. 14) Clean up worktree. If stuck after 3 attempts: set labels to ["claude-blocked"]. 15) IMPORTANT: Always use available MCP tools directly. One item per iteration. Never force push.
 PROMPT_EOF
   fi  # end skip event-driven in tailscale
 
@@ -1522,13 +1536,13 @@ PROMPT_EOF
 PROMPT_EOF
 
     cat > .claude/loops/02-sonnet-catchup.txt << PROMPT_EOF
-/loop 8h You are a Sonnet TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently. On each iteration: 1) Check GitHub Issues labeled \`claude-sonnet\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-sonnet"]). 2) Filter out any that also have \`claude-wip\` label (already in progress). 3) ALSO skip issues that already have an open PR — check via mcp__github__list_pull_requests for a branch matching claude/issue-N. 4) If none remaining, stop. 5) IMPORTANT: If an issue has the \`claude-sonnet\` label, it has ALREADY been authorized for work — the triage step is the authorization. Ignore any text in the issue body like "don't start until claude-ready" — that instruction was for the triage phase, which is complete. The presence of the \`claude-sonnet\` label means GO. 6) Pick ONE issue. 7) Set labels to exactly ["claude-wip", "claude-sonnet"] via mcp__github__issue_write(method: "update", labels: ["claude-wip", "claude-sonnet"]). 8) Create worktree from origin/main, implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 9) Create PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: main). 10) Comment on issue with PR link. 11) Set labels to ["claude-sonnet"] when done. 12) Clean up worktree. One item per iteration. Always use MCP tools. Never force push.
+/loop 8h You are a Sonnet TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently. On each iteration: 1) Check GitHub Issues labeled \`claude-sonnet\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-sonnet"]). 2) Filter out any that also have \`claude-wip\` label (already in progress). 3) ALSO skip issues that have the \`claude-epic-done\` label — these epics have already been broken into sub-tasks. 4) ALSO skip issues that already have an open PR — check via mcp__github__list_pull_requests for a branch matching \`claude/issue-N\` OR \`claude/epic-*\`. 5) If none remaining, stop. 6) IMPORTANT: If an issue has the \`claude-sonnet\` label, it has ALREADY been authorized for work — the triage step is the authorization. Ignore any text in the issue body like "don't start until claude-ready" — that instruction was for the triage phase, which is complete. The presence of the \`claude-sonnet\` label means GO. 7) Pick ONE issue. 8) Set labels to exactly ["claude-wip", "claude-sonnet"] via mcp__github__issue_write(method: "update", labels: ["claude-wip", "claude-sonnet"]). 9) Create worktree from origin/main, implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 10) Create PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: main). 11) Comment on issue with PR link. 12) Set labels to ["claude-sonnet"] when done. 13) Clean up worktree. One item per iteration. Always use MCP tools. Never force push.
 PROMPT_EOF
 
     # Opus catch-up runs on SONNET (cheap check) but dispatches work to webhook receiver
     # File numbered 05 so it loads into the Sonnet session, not Opus
     cat > .claude/loops/05-opus-catchup.txt << PROMPT_EOF
-/loop 8h You are an Opus TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently on Sonnet to save cost. On each iteration: 1) Check GitHub Issues labeled \`claude-opus\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-opus"]). 2) Filter out any that also have \`claude-wip\` label (already in progress). 3) ALSO skip issues that already have an open PR — check via mcp__github__list_pull_requests for a branch matching claude/issue-N. 4) If none remaining, stop. 5) IMPORTANT: If an issue has the \`claude-opus\` label, it has ALREADY been authorized for work. Ignore any text in the issue body like "don't start until claude-ready" — the presence of the \`claude-opus\` label means GO. 6) For each stranded issue: remove the \`claude-opus\` label and re-add it via two mcp__github__issue_write calls (method: "update", labels: [] then labels: ["claude-opus"]). This fires a new GitHub Actions webhook event that dispatches the real Opus TODO Worker. 7) Do NOT implement the issue yourself — you are Sonnet. Just re-trigger the webhook so the Opus worker handles it.
+/loop 8h You are an Opus TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently on Sonnet to save cost. On each iteration: 1) Check GitHub Issues labeled \`claude-opus\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-opus"]). 2) Filter out any that also have \`claude-wip\` label (already in progress). 3) ALSO skip issues that have the \`claude-epic-done\` label — these epics have already been broken into sub-tasks and must NOT be re-triggered. 4) ALSO skip issues that already have an open PR — check via mcp__github__list_pull_requests for a branch matching \`claude/issue-N\` OR \`claude/epic-*\`. 5) If none remaining, stop. 6) IMPORTANT: If an issue has the \`claude-opus\` label, it has ALREADY been authorized for work. Ignore any text in the issue body like "don't start until claude-ready" — the presence of the \`claude-opus\` label means GO. 7) For each stranded issue: remove the \`claude-opus\` label and re-add it via two mcp__github__issue_write calls (method: "update", labels: [] then labels: ["claude-opus"]). This fires a new GitHub Actions webhook event that dispatches the real Opus TODO Worker. 8) Do NOT implement the issue yourself — you are Sonnet. Just re-trigger the webhook so the Opus worker handles it.
 PROMPT_EOF
 
     # Remove old 08-opus-catchup.txt if it exists from previous runs
@@ -1551,7 +1565,7 @@ else
   # Event-driven loops: skip in Tailscale mode (webhook receiver handles these)
   if [[ "$AGENT_MODE" != "tailscale" ]]; then
     cat > .claude/loops/01-todo-worker.txt << PROMPT_EOF
-/loop $WORKER_INTERVAL You are a TODO Worker loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) Check GitHub Issues labeled \`claude-ready\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-ready"]). 2) ALSO check issues labeled \`claude-wip\` for new user comments — use mcp__github__issue_read with method "get_comments" to see if the user has replied with decisions, approvals, or feedback. 3) Scan for inline \`// TODO(@claude):\` comments in ${SRC_DIR:-src}/ — these are micro-tasks. 4) If nothing found and no new user comments on wip issues, stop. 5) Pick ONE item (prefer issues over TODOs). 6) For issues: set labels to exactly ["claude-wip"] via mcp__github__issue_write(method: "update", labels: ["claude-wip"]) — this REPLACES all labels, removing claude-ready. 7) Check if the issue is an epic (describes a large project with sub-tasks). If yes: create the epic branch \`claude/epic-<name>\`, break down into sub-issues, create them via mcp__github__issue_write. 8) For regular issues: check if it's a sub-task of a larger epic. If yes: create worktree from the epic branch, PR against that branch. If no: create worktree from origin/main, PR against main. 9) Implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 10) Create a PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: epic-branch-or-main) with title from the issue and body that says "Closes #N" plus a summary. 11) Comment on the issue with the PR link via mcp__github__add_issue_comment. 12) Clean up worktree. If stuck after 3 attempts: add \`claude-blocked\` label. 13) For inline TODOs: same flow — implement, remove the comment, commit+push, create PR. 14) For wip issues with new user comments: incorporate feedback, reply acknowledging. 15) IMPORTANT: Always use available MCP tools directly. One item per iteration. Never force push.
+/loop $WORKER_INTERVAL You are a TODO Worker loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) Check GitHub Issues labeled \`claude-ready\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-ready"]). 2) ALSO check issues labeled \`claude-wip\` for new user comments — use mcp__github__issue_read with method "get_comments" to see if the user has replied with decisions, approvals, or feedback. 3) Skip any issues that have the \`claude-epic-done\` label — these epics have already been broken down. 4) Scan for inline \`// TODO(@claude):\` comments in ${SRC_DIR:-src}/ — these are micro-tasks. 5) If nothing found and no new user comments on wip issues, stop. 6) Pick ONE item (prefer issues over TODOs). 7) For issues: set labels to exactly ["claude-wip"] via mcp__github__issue_write(method: "update", labels: ["claude-wip"]) — this REPLACES all labels, removing claude-ready. 8) Check if the issue is an epic (describes a large project with sub-tasks). If yes: create the epic branch \`claude/epic-<name>\`, break down into sub-issues, create them via mcp__github__issue_write, then set the EPIC issue labels to ["claude-epic-done"] — this marks the epic as decomposed so it is never re-processed. Comment on the epic: "Epic broken down into N sub-tasks. Sub-task issues created." Then move to next iteration — do NOT implement the epic itself. 9) For regular issues: check if it's a sub-task of a larger epic. If yes: create worktree from the epic branch, PR against that branch. If no: create worktree from origin/main, PR against main. 10) Implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 11) Create a PR via mcp__github__create_pull_request (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, head: branch, base: epic-branch-or-main) with title from the issue and body that says "Closes #N" plus a summary. 12) Comment on the issue with the PR link via mcp__github__add_issue_comment. 13) Clean up worktree. If stuck after 3 attempts: add \`claude-blocked\` label. 14) For inline TODOs: same flow — implement, remove the comment, commit+push, create PR. 15) For wip issues with new user comments: incorporate feedback, reply acknowledging. 16) IMPORTANT: Always use available MCP tools directly. One item per iteration. Never force push.
 PROMPT_EOF
   fi  # end skip event-driven in tailscale
 
@@ -1571,7 +1585,7 @@ PROMPT_EOF
   # Event-driven: skip in Tailscale mode
   if [[ "$AGENT_MODE" != "tailscale" ]]; then
     cat > .claude/loops/04-pr-responder.txt << PROMPT_EOF
-/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages. If none, stop. 4) For changes you can handle (max 3): create worktree from PR branch, make the requested change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 5) For inline comments: reply via mcp__github__add_reply_to_pull_request_comment. For general comments: reply via mcp__github__add_issue_comment. Body: "Addressed in latest commit." 6) If the comment asks you to run something (SQL, deploy, etc.) and you have an MCP tool for it, execute it directly. 7) If truly stuck after 3 attempts on a comment, add \`claude-blocked\` label to the PR and reply explaining the difficulty. 8) Clean up worktree. Never force push.
+/loop $RESPONDER_INTERVAL You are a PR Comment Responder loop for ${GITHUB_USER}/${GITHUB_REPO}. On each iteration: 1) List open PRs via mcp__github__list_pull_requests (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}). 2) Check BOTH inline review comments (get_review_comments) AND general PR comments (get_comments) via mcp__github__pull_request_read. 3) Filter for actionable requests — skip approvals, acks, bot messages, comments containing \`<!-- claude-agent -->\`, and comments ending with \`· claude-sonnet-\` or \`· claude-opus-\` (bot self-replies). Skip closed/merged PRs. Skip PRs with \`claude-blocked\` label. CIRCUIT BREAKER: if 3+ consecutive latest comments on a PR match the bot signature pattern, skip that PR entirely. If none remain, stop. 4) For changes you can handle (max 3): create worktree from PR branch, make the requested change, verify ${VERIFY_CHAIN:-lint+build+test}, commit+push to the PR branch. 5) For inline comments: reply via mcp__github__add_reply_to_pull_request_comment. For general comments: reply via mcp__github__add_issue_comment. Your reply MUST end with EXACTLY: \`\\n\\n— PR Comment Responder · claude-sonnet-4-6\\n<!-- claude-agent -->\`. The marker is REQUIRED to prevent self-reply loops. 6) If the comment asks you to run something (SQL, deploy, etc.) and you have an MCP tool for it, execute it directly. 7) If truly stuck after 3 attempts on a comment, add \`claude-blocked\` label to the PR and reply explaining the difficulty. 8) Clean up worktree. Never force push.
 PROMPT_EOF
   fi  # end skip event-driven in tailscale
 
@@ -1588,7 +1602,7 @@ PROMPT_EOF
   if [[ "$AGENT_MODE" == "tailscale" ]]; then
     # Single-mode catch-up loop for Tailscale
     cat > .claude/loops/01-todo-catchup.txt << PROMPT_EOF
-/loop 8h You are a TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently. On each iteration: 1) Check GitHub Issues labeled \`claude-ready\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-ready"]). 2) Filter out any that also have \`claude-wip\` (already in progress). 3) If none found, stop. 4) Pick ONE issue. 5) Set labels to exactly ["claude-wip"] via mcp__github__issue_write(method: "update", labels: ["claude-wip"]) — REPLACES all labels. 6) Create worktree from origin/main, implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 7) Create PR via mcp__github__create_pull_request, comment on issue. 8) Set labels to [] when done. 9) Clean up worktree. One item per iteration. Always use MCP tools. Never force push.
+/loop 8h You are a TODO Catch-Up loop for ${GITHUB_USER}/${GITHUB_REPO}. Safety net for issues missed by webhook — runs infrequently. On each iteration: 1) Check GitHub Issues labeled \`claude-ready\` using mcp__github__list_issues (owner: ${GITHUB_USER}, repo: ${GITHUB_REPO}, labels: ["claude-ready"]). 2) Filter out any that also have \`claude-wip\` (already in progress). 3) ALSO skip issues that have the \`claude-epic-done\` label — these epics have already been broken into sub-tasks. 4) ALSO skip issues that already have an open PR — check via mcp__github__list_pull_requests for a branch matching \`claude/issue-N\` OR \`claude/epic-*\`. 5) If none found, stop. 6) Pick ONE issue. 7) Set labels to exactly ["claude-wip"] via mcp__github__issue_write(method: "update", labels: ["claude-wip"]) — REPLACES all labels. 8) Create worktree from origin/main, implement the change, run ${VERIFY_CHAIN:-tests}, commit+push. 9) Create PR via mcp__github__create_pull_request, comment on issue. 10) Set labels to [] when done. 11) Clean up worktree. One item per iteration. Always use MCP tools. Never force push.
 PROMPT_EOF
 
     LOOP_FILE_COUNT=2  # quality-sweep + catch-up
@@ -1634,7 +1648,7 @@ for f in .claude/loops/*.txt; do
     model="$SINGLE_MODEL"
   fi
 
-  sed -i "1s/$/ SIGNING: End every GitHub comment and PR body with a footer line: — $agent · $model/" "$f"
+  sed -i "1s/$/ SIGNING: End every GitHub comment and PR body with a footer: — $agent · $model followed by a newline and <!-- claude-agent --> on the last line. If a comment contains <!-- claude-agent --> it is a bot reply — skip it./" "$f"
 done
 echo "Added signing instructions to loop prompts"
 
@@ -1725,7 +1739,11 @@ jobs:
   trigger:
     if: |
       !contains(github.event.comment.user.login, '[bot]') &&
-      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null)
+      !contains(github.event.comment.body, '<!-- claude-agent -->') &&
+      !contains(github.event.comment.body, '· claude-sonnet-') &&
+      !contains(github.event.comment.body, '· claude-opus-') &&
+      !contains(toJson(github.event.issue.labels.*.name), 'claude-blocked') &&
+      (github.event_name == 'pull_request_review_comment' || (github.event.issue.pull_request != null && github.event.issue.state == 'open'))
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -1743,6 +1761,8 @@ jobs:
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           REPO: ${{ github.repository }}
+          PR_STATE: ${{ github.event.issue.state || github.event.pull_request.state || 'open' }}
+          PR_LABELS: ${{ toJson(github.event.issue.labels.*.name) }}
         run: |
           curl -sf --retry 3 --retry-delay 2 -X POST \
             "http://__TS_HOSTNAME__:9876/webhook" \
@@ -1755,7 +1775,9 @@ jobs:
               --arg comment_author "$COMMENT_AUTHOR" \
               --arg pr_branch "$PR_BRANCH" \
               --arg repo "$REPO" \
-              '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo}')"
+              --arg pr_state "$PR_STATE" \
+              --arg pr_labels "$PR_LABELS" \
+              '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo,pr_state:$pr_state,pr_labels:$pr_labels}')"
 YAML_EOF
 
   sed -i "s|__TS_HOSTNAME__|${TS_HOSTNAME}|g; s|__TS_TAG__|${TS_TAG}|g" \
@@ -1793,7 +1815,7 @@ single_model = os.environ.get('RECEIVER_SINGLE_MODEL', 'claude-sonnet-4-6')
 
 code = r'''#!/usr/bin/env python3
 """Claude agent webhook receiver — generated by claude-agent-bootstrap/setup.sh"""
-import http.server, json, os, subprocess, threading, logging, sys
+import http.server, json, os, subprocess, threading, logging, sys, time
 
 logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
 
@@ -1838,10 +1860,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
 _in_flight = set()
 _in_flight_lock = threading.Lock()
 
+# Circuit breaker: hard cap on responses per PR per time window
+_pr_response_count = {}
+_pr_response_lock = threading.Lock()
+_PR_MAX_RESPONSES = 3
+_PR_WINDOW_SECONDS = 600
+
 
 def dispatch(p):
     t = p.get('type')
     logging.info(f'Event: {t}  repo={p.get("repo", "?")}')
+
+    # Self-reply guard: skip bot's own comments (marker-based)
+    if t == 'pr_comment' and '<!-- claude-agent -->' in p.get('comment_body', ''):
+        logging.info(f'Skipping self-reply (marker detected)')
+        return
+
+    # Self-reply guard: visible signature (LLM reliably generates this even when marker is missing)
+    if t == 'pr_comment':
+        body = p.get('comment_body', '')
+        if '\u00b7 claude-sonnet-' in body or '\u00b7 claude-opus-' in body:
+            logging.info('Skipping self-reply (visible signature detected)')
+            return
+
+    # Closed/merged PR guard
+    if t == 'pr_comment' and p.get('pr_state') == 'closed':
+        logging.info(f'Skipping PR #{p.get("pr_number")} \u2014 closed/merged')
+        return
+
+    # claude-blocked label guard
+    if t == 'pr_comment' and 'claude-blocked' in p.get('pr_labels', ''):
+        logging.info(f'Skipping PR #{p.get("pr_number")} \u2014 claude-blocked label')
+        return
+
+    # Circuit breaker: max N responses per PR per time window
+    if t == 'pr_comment':
+        pr_num = p.get('pr_number', 0)
+        now = time.time()
+        with _pr_response_lock:
+            count, first_seen = _pr_response_count.get(pr_num, (0, now))
+            if now - first_seen > _PR_WINDOW_SECONDS:
+                count, first_seen = 0, now
+            count += 1
+            _pr_response_count[pr_num] = (count, first_seen)
+            if count > _PR_MAX_RESPONSES:
+                logging.warning(f'CIRCUIT BREAKER: {count} responses to PR #{pr_num} in {int(now - first_seen)}s \u2014 blocking')
+                return
 
     # Dedup: prevent multiple workers for the same event
     key = (t, p.get('label', ''), p.get('number') or p.get('pr_number', ''))
@@ -1850,10 +1914,6 @@ def dispatch(p):
             logging.info(f'Skipping {key} — already in flight')
             return
         _in_flight.add(key)
-    def _expire():
-        with _in_flight_lock:
-            _in_flight.discard(key)
-    threading.Timer(1800, _expire).start()
 
     if t == 'issue':
         label = p.get('label', 'claude-ready')
@@ -1882,14 +1942,33 @@ def dispatch(p):
         prompt  = pr_comment_prompt(p)
     else:
         logging.warning(f'Unknown event type: {t}')
+        with _in_flight_lock:
+            _in_flight.discard(key)
         return
     escaped = shell_escape_dq(prompt)
     cmd = f'claude --model {model} --print "{escaped}"'
-    result = subprocess.run(['tmux', 'new-window', '-t', session, cmd])
-    if result.returncode == 0:
+    # Use tmux wait-for + remain-on-exit to detect when the worker finishes.
+    # This lets us expire the dedup key immediately instead of a fixed 30m timer.
+    window_id = f'worker-{key[2]}-{threading.get_ident() % 10000}'
+    spawn = subprocess.run([
+        'tmux', 'new-window', '-d', '-t', session,
+        '-n', window_id,
+        '-PF', '#{pane_id}',
+        f'{cmd}; tmux wait-for -S {window_id}',
+    ], capture_output=True, text=True)
+    if spawn.returncode == 0:
         logging.info(f'Spawned {model} in {session}')
+        def _wait_and_expire():
+            subprocess.run(['tmux', 'wait-for', window_id], timeout=3600,
+                           capture_output=True)
+            with _in_flight_lock:
+                _in_flight.discard(key)
+            logging.info(f'Worker done, released {key}')
+        threading.Thread(target=_wait_and_expire, daemon=True).start()
     else:
         logging.error(f'Failed to open tmux window in {session} — is the session running?')
+        with _in_flight_lock:
+            _in_flight.discard(key)
 
 
 def triage_prompt(p):
@@ -1932,9 +2011,11 @@ def issue_prompt(p, model):
         model_label = 'claude-opus' if 'opus' in model else 'claude-sonnet'
         claim_labels = f'["claude-wip", "{model_label}"]'
         done_labels = f'["{model_label}"]'
+        epic_done_labels = f'["{model_label}", "claude-epic-done"]'
     else:
         claim_labels = '["claude-wip"]'
         done_labels = '[]'
+        epic_done_labels = '["claude-epic-done"]'
     return f"""You are a TODO Worker for {REPO}. Process this single issue then exit — do NOT loop.
 
 Issue #{number}: {title}
@@ -1943,15 +2024,27 @@ Issue #{number}: {title}
 
 Steps:
 1. Set the issue labels to exactly {claim_labels} via mcp__github__issue_write(method: "update", owner: {owner}, repo: {repo_s}, issue_number: {number}, labels: {claim_labels}) — this REPLACES all labels, removing any stale claude-ready.
-2. git worktree add /tmp/{repo_s}-issue-{number} -b claude/issue-{number} origin/main
-3. Implement the requested change
-4. Verify: {verify}
-5. git commit -m "feat: <summary>" && git push -u origin claude/issue-{number}
-6. mcp__github__create_pull_request (owner: {owner}, repo: {repo_s}, head: claude/issue-{number}, base: main, title: "<summary>", body: "Closes #{number}")
-7. mcp__github__add_issue_comment (owner: {owner}, repo: {repo_s}, issue_number: {number}, body: "PR: <link>")
-8. Set the issue labels to {done_labels} via mcp__github__issue_write(method: "update", owner: {owner}, repo: {repo_s}, issue_number: {number}, labels: {done_labels}) — removes claude-wip.
-9. git worktree remove /tmp/{repo_s}-issue-{number}
-10. If stuck after 3 attempts: set labels to ["claude-blocked"] via mcp__github__issue_write
+2. EPIC CHECK: Read the issue title and body carefully. If this issue describes a **large project or epic** with multiple sub-tasks (look for: checklist of features, "phase 1/2/3", multiple distinct deliverables, explicit sub-task lists), then follow the EPIC PATH below. Otherwise, follow the REGULAR PATH.
+
+--- EPIC PATH (issue is an epic) ---
+2a. Create the epic branch: git push origin origin/main:refs/heads/claude/epic-{number}
+2b. Break the epic into individual sub-task issues. For each sub-task: mcp__github__issue_write(method: "create", owner: {owner}, repo: {repo_s}, title: "<sub-task title>", body: "Sub-task of #{number}. Parent epic branch: claude/epic-{number}\\n\\n<description>"). Label each sub-task based on complexity — simple tasks get the appropriate model label.
+2c. Comment on this epic issue: mcp__github__add_issue_comment(owner: {owner}, repo: {repo_s}, issue_number: {number}, body: "Epic broken down into N sub-tasks. Sub-task issues created: #X, #Y, #Z...")
+2d. Set the epic issue labels to {epic_done_labels} via mcp__github__issue_write(method: "update", owner: {owner}, repo: {repo_s}, issue_number: {number}, labels: {epic_done_labels}) — marks epic as decomposed so catch-up loops never re-process it.
+2e. Exit. Do NOT implement the epic itself — the sub-tasks will be picked up individually.
+
+--- REGULAR PATH (issue is a normal task) ---
+3. Check if this issue is a sub-task of a larger epic (look for: "Sub-task of #N", "Parent epic branch: claude/epic-*" in the body). If yes: create worktree from the epic branch and PR against it. If no: create worktree from origin/main and PR against main.
+4. For regular (non-epic-subtask): git worktree add /tmp/{repo_s}-issue-{number} -b claude/issue-{number} origin/main
+   For epic sub-task: git worktree add /tmp/{repo_s}-issue-{number} -b claude/issue-{number} origin/claude/epic-<parent>
+5. Implement the requested change
+6. Verify: {verify}
+7. git commit -m "feat: <summary>" && git push -u origin claude/issue-{number}
+8. mcp__github__create_pull_request (owner: {owner}, repo: {repo_s}, head: claude/issue-{number}, base: <epic-branch-or-main>, title: "<summary>", body: "Closes #{number}")
+9. mcp__github__add_issue_comment (owner: {owner}, repo: {repo_s}, issue_number: {number}, body: "PR: <link>")
+10. Set the issue labels to {done_labels} via mcp__github__issue_write(method: "update", owner: {owner}, repo: {repo_s}, issue_number: {number}, labels: {done_labels}) — removes claude-wip.
+11. git worktree remove /tmp/{repo_s}-issue-{number}
+12. If stuck after 3 attempts: set labels to ["claude-blocked"] via mcp__github__issue_write
 
 Always use MCP tools directly. Never force push.
 — TODO Worker · {model}"""
@@ -1972,14 +2065,24 @@ Comment by {author}:
 {comment}
 
 Steps:
-1. mcp__github__pull_request_read (owner: {owner}, repo: {repo_s}, pull_number: {pr_num}) to understand context
+0. SAFETY CHECKS (exit immediately if ANY match):
+   0a. If the comment contains `<!-- claude-agent -->`, exit — it is a bot reply.
+   0b. If the comment ends with `\u00b7 claude-sonnet-` or `\u00b7 claude-opus-` (visible bot signature), exit — it is a bot reply.
+   0c. mcp__github__pull_request_read (owner: {owner}, repo: {repo_s}, pull_number: {pr_num}) — if the PR state is "closed" or "merged", exit immediately. Do NOT comment on closed/merged PRs.
+   0d. Check the PR labels — if `claude-blocked` label is present, exit immediately.
+   0e. Check the last 5 comments on the PR. If 3 or more consecutive recent comments match the bot signature pattern (`\u00b7 claude-sonnet-` or `\u00b7 claude-opus-` or `<!-- claude-agent -->`), exit immediately — self-conversation detected.
+1. mcp__github__pull_request_read (owner: {owner}, repo: {repo_s}, pull_number: {pr_num}) to understand context (reuse from 0c if already fetched)
 2. If simple fix (typo, rename, small change): git worktree from {branch}, make change, verify: {verify}, push to {branch}
-3. Reply "Addressed in latest commit." via mcp__github__add_issue_comment or mcp__github__add_reply_to_pull_request_comment
-4. If complex rework: reply "Escalating to opus session" and add label claude-opus to the PR
+3. Reply via mcp__github__add_issue_comment or mcp__github__add_reply_to_pull_request_comment.
+   CRITICAL — Your reply body MUST end with EXACTLY these two lines:
+   \u2014 PR Comment Responder \u00b7 claude-sonnet-4-6
+   <!-- claude-agent -->
+   The <!-- claude-agent --> marker is REQUIRED. Without it, your comment triggers an infinite self-reply loop.
+4. If complex rework: reply "Escalating to opus session" (with the same two-line ending above) and add label claude-opus to the PR
 5. git worktree remove when done
 
 Never force push.
-— PR Comment Responder · claude-sonnet-4-6"""
+\u2014 PR Comment Responder \u00b7 claude-sonnet-4-6"""
 
 
 if __name__ == '__main__':
@@ -2062,7 +2165,11 @@ jobs:
   queue:
     if: |
       !contains(github.event.comment.user.login, '[bot]') &&
-      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null)
+      !contains(github.event.comment.body, '<!-- claude-agent -->') &&
+      !contains(github.event.comment.body, '· claude-sonnet-') &&
+      !contains(github.event.comment.body, '· claude-opus-') &&
+      !contains(toJson(github.event.issue.labels.*.name), 'claude-blocked') &&
+      (github.event_name == 'pull_request_review_comment' || (github.event.issue.pull_request != null && github.event.issue.state == 'open'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2075,6 +2182,8 @@ jobs:
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           REPO: ${{ github.repository }}
+          PR_STATE: ${{ github.event.issue.state || github.event.pull_request.state || 'open' }}
+          PR_LABELS: ${{ toJson(github.event.issue.labels.*.name) }}
         run: |
           TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
           FILENAME="pr-${PR_NUMBER}-${TIMESTAMP}.json"
@@ -2085,8 +2194,10 @@ jobs:
             --arg comment_author "$COMMENT_AUTHOR" \
             --arg pr_branch "$PR_BRANCH" \
             --arg repo "$REPO" \
+            --arg pr_state "$PR_STATE" \
+            --arg pr_labels "$PR_LABELS" \
             --arg queued_at "$TIMESTAMP" \
-            '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo,queued_at:$queued_at}')
+            '{type:$type,pr_number:$pr_number,comment_body:$comment_body,comment_author:$comment_author,pr_branch:$pr_branch,repo:$repo,pr_state:$pr_state,pr_labels:$pr_labels,queued_at:$queued_at}')
           CONTENT_B64=$(echo "$CONTENT" | base64 -w 0)
           curl -sf -X PUT \
             -H "Authorization: token $GH_TOKEN" \
@@ -2222,11 +2333,12 @@ if [[ "$MODEL_MODE" == "dual" ]]; then
 #!/usr/bin/env bash
 #
 # Start the Claude agent fleet — two tmux sessions, 7 loops total.
-# Usage: ./start-loops.sh          (start both sessions)
-#        ./start-loops.sh sonnet   (start only Sonnet session)
-#        ./start-loops.sh opus     (start only Opus session)
-#        ./start-loops.sh stop     (kill both sessions)
-#        ./start-loops.sh --dry-run (print prompts without starting)
+# Usage: ./start-loops.sh               (start both sessions)
+#        ./start-loops.sh sonnet        (start only Sonnet session)
+#        ./start-loops.sh opus          (start only Opus session)
+#        ./start-loops.sh stop          (kill both sessions)
+#        ./start-loops.sh --dry-run     (print prompts without starting)
+#        ./start-loops.sh --force-setup (re-run first-time setup)
 #
 set -euo pipefail
 
@@ -2236,6 +2348,14 @@ cd "$REPO_ROOT"
 SONNET_SESSION="claude-sonnet"
 OPUS_SESSION="claude-opus"
 LOOP_DIR=".claude/loops"
+
+# --- Force-setup flag ---
+for arg in "$@"; do
+  if [[ "$arg" == "--force-setup" ]]; then
+    rm -f "$LOOP_DIR/.setup-done"
+    echo "Cleared setup marker — will re-run first-time setup"
+  fi
+done
 
 # --- Dry-run mode ---
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -2368,13 +2488,16 @@ start_sonnet() {
 
   # Send setup one-shot LAST — it does real work (labels, issues) and takes time.
   # All loops are already registered so nothing gets blocked.
-  if [[ -f "$LOOP_DIR/00-setup.txt" ]]; then
+  if [[ -f "$LOOP_DIR/00-setup.txt" ]] && [[ ! -f "$LOOP_DIR/.setup-done" ]]; then
     echo "  Running setup one-shot..."
     if wait_for_idle "$SONNET_SESSION"; then
       send_loop "$SONNET_SESSION" "$LOOP_DIR/00-setup.txt"
+      touch "$LOOP_DIR/.setup-done"
     else
       echo "WARNING: Timed out before setup one-shot, skipping"
     fi
+  else
+    [[ -f "$LOOP_DIR/.setup-done" ]] && echo "  Setup already completed (skipping)"
   fi
 
   local count=0
@@ -2418,7 +2541,7 @@ start_opus() {
 case "${1:-all}" in
   sonnet) start_sonnet ;;
   opus)   start_opus ;;
-  all)
+  all|--force-setup)
     start_sonnet
     echo ""
     start_opus
@@ -2433,7 +2556,7 @@ case "${1:-all}" in
     echo ""
     ;;
   *)
-    echo "Usage: ./start-loops.sh [sonnet|opus|stop|--dry-run|all]"
+    echo "Usage: ./start-loops.sh [sonnet|opus|stop|--dry-run|--force-setup|all]"
     exit 1
     ;;
 esac
@@ -2445,9 +2568,10 @@ else
 #!/usr/bin/env bash
 #
 # Start the Claude agent fleet — one tmux session.
-# Usage: ./start-loops.sh          (start session)
-#        ./start-loops.sh stop     (kill session)
-#        ./start-loops.sh --dry-run (print prompts without starting)
+# Usage: ./start-loops.sh               (start session)
+#        ./start-loops.sh stop          (kill session)
+#        ./start-loops.sh --dry-run     (print prompts without starting)
+#        ./start-loops.sh --force-setup (re-run first-time setup)
 #
 set -euo pipefail
 
@@ -2457,6 +2581,14 @@ cd "\$REPO_ROOT"
 SESSION="claude-agent"
 MODEL="$SINGLE_MODEL"
 LOOP_DIR=".claude/loops"
+
+# --- Force-setup flag ---
+for arg in "\$@"; do
+  if [[ "\$arg" == "--force-setup" ]]; then
+    rm -f "\$LOOP_DIR/.setup-done"
+    echo "Cleared setup marker — will re-run first-time setup"
+  fi
+done
 
 # --- Dry-run mode ---
 if [[ "\${1:-}" == "--dry-run" ]]; then
@@ -2575,13 +2707,16 @@ done
 
 # Send setup one-shot LAST — it does real work (labels, issues) and takes time.
 # All loops are already registered so nothing gets blocked.
-if [[ -f "\$LOOP_DIR/00-setup.txt" ]]; then
+if [[ -f "\$LOOP_DIR/00-setup.txt" ]] && [[ ! -f "\$LOOP_DIR/.setup-done" ]]; then
   echo "  Running setup one-shot..."
   if wait_for_idle "\$SESSION"; then
     send_loop "\$SESSION" "\$LOOP_DIR/00-setup.txt"
+    touch "\$LOOP_DIR/.setup-done"
   else
     echo "WARNING: Timed out before setup one-shot, skipping"
   fi
+else
+  [[ -f "\$LOOP_DIR/.setup-done" ]] && echo "  Setup already completed (skipping)"
 fi
 
 echo ""
