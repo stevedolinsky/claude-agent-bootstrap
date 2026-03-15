@@ -36,7 +36,8 @@ respond to PR review comments, and refactor code — all without human intervent
 
 3. Answer 3 questions (model mode, labels, loop speed), then:
    ```bash
-   ./start-loops.sh
+   git push           # activates GHA workflows
+   ./start-loops.sh   # starts Claude sessions (+ webhook receiver if Tailscale)
    ```
 
 That's it. The agents are running.
@@ -47,6 +48,78 @@ That's it. The agents are running.
 ~/claude-agent-bootstrap/setup.sh --defaults
 ```
 Uses: single-sonnet, auto-labels, normal speed. Good for CI or scripting.
+
+## Event-Driven Architecture
+
+Instead of Claude polling GitHub every few minutes (expensive, noisy), setup.sh generates
+GitHub Actions workflows that push events to Claude the instant something happens.
+
+**Mode is auto-detected at setup time** — no choice required:
+
+| Condition | Mode | How it works |
+|-----------|------|-------------|
+| Tailscale running on your machine | **Tailscale Push** | GHA joins your Tailscale network, POSTs event to your machine. Claude only runs when there's actual work. |
+| No Tailscale | **Queue Branch** | GHA writes JSON to a `claude-queue` branch. Claude reads the queue each loop iteration. |
+
+### Tailscale Mode (zero polling)
+
+```
+Issue labeled →  GHA workflow  →  joins Tailscale  →  POST /webhook  →  webhook-receiver.py
+                                                                              │
+                                                                    tmux new-window
+                                                                    claude --print "process issue #N"
+                                                                    (fresh session, exits when done)
+```
+
+**One-time setup** (if you haven't already):
+
+1. **Create the Tailscale tag** — tailscale.com → Access Controls → add to `tagOwners`:
+   ```json
+   "tagOwners": { "tag:ci": [] }
+   ```
+
+2. **Create OAuth client** — tailscale.com → Settings → OAuth clients:
+   - Scope: `devices:core:write`
+   - Tag: `tag:ci`
+
+3. **Add 3 secrets** to GitHub repo Settings → Secrets → Actions:
+   | Secret | Value |
+   |--------|-------|
+   | `TS_OAUTH_CLIENT_ID` | From OAuth client above |
+   | `TS_OAUTH_SECRET` | From OAuth client above |
+   | `AGENT_WEBHOOK_SECRET` | Printed by setup.sh at end of run |
+
+The machine hostname is baked into the workflow at setup time. The `webhook-receiver.py`
+runs locally (started by `./start-loops.sh`). Each issue/PR comment spawns a fresh Claude
+session — zero context accumulation over time.
+
+**Generated files (Tailscale mode):**
+- `.github/workflows/agent-webhook-issue.yml` — fires on `issues: labeled`
+- `.github/workflows/agent-webhook-pr-comment.yml` — fires on PR/issue comments
+- `webhook-receiver.py` — local server (gitignored, started by start-loops.sh)
+
+### Queue Branch Mode (no secrets needed)
+
+```
+Issue labeled →  GHA workflow  →  writes JSON  →  claude-queue/pending/<item>.json
+                                                              │
+                                                   Claude reads queue each loop iteration
+                                                   (1 API call vs ~50K tokens of scanning)
+```
+
+No secrets required — uses the built-in `GITHUB_TOKEN`.
+
+**Generated files (queue mode):**
+- `.github/workflows/agent-queue-issue.yml` — writes issue events to queue branch
+- `.github/workflows/agent-queue-pr-comment.yml` — writes PR comment events to queue branch
+- `claude-queue` branch on GitHub — orphan branch with `pending/` and `processed/` dirs
+
+### Changing the Tailscale tag
+
+The default tag is `tag:ci`. To use a different tag (e.g. `tag:github-actions`):
+1. Delete `.claude/bootstrap.conf` in your project
+2. Re-run `setup.sh` — it picks up the new default
+   OR edit the generated workflow files directly and change `tag:ci` to your tag
 
 ## How It Works
 
@@ -87,9 +160,12 @@ Issue filed → [Triage Worker] → Sonnet or Opus Worker → PR created → You
 | `LOOPS.md` | Loop documentation and manual paste commands |
 | `.claude/settings.json` | Permissions for autonomous operation |
 | `.claude/loops/*.txt` | Individual loop prompts |
-| `.claude/bootstrap.conf` | Your config (model mode, speed, etc.) |
-| `start-loops.sh` | tmux launcher |
+| `.claude/bootstrap.conf` | Your config (model mode, speed, Tailscale tag) |
+| `start-loops.sh` | tmux launcher (also starts webhook receiver) |
 | `.github/workflows/ci.yml` | CI pipeline (if applicable) |
+| `.github/workflows/agent-webhook-*.yml` | GHA → local push (Tailscale mode) |
+| `.github/workflows/agent-queue-*.yml` | GHA → queue branch (queue mode) |
+| `webhook-receiver.py` | Local webhook server, gitignored (Tailscale mode) |
 
 ## Managing the Fleet
 
