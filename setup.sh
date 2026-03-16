@@ -1829,6 +1829,10 @@ DUAL_MODE      = __DUAL_MODE__
 SINGLE_MODEL   = '__SINGLE_MODEL__'
 PORT           = 9876
 
+_EVENTS_PATH = os.path.expanduser('~/.claude/agent-events.jsonl')
+_log_lock = threading.Lock()
+_log_fh = None  # opened lazily on first write
+
 try:
     SECRET = open(os.path.expanduser('~/.claude/agent-webhook.secret')).read().strip()
 except FileNotFoundError:
@@ -1840,6 +1844,33 @@ except FileNotFoundError:
 def shell_escape_dq(s):
     """Escape for embedding in a bash double-quoted shell context."""
     return str(s).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+
+
+def log_event(action, event_type=None, number=None, model=None,
+              worker_id=None, detail=None, repo=None,
+              duration_seconds=None, total_seconds=None):
+    """Append a structured event to the JSONL log. Failures never affect dispatch."""
+    global _log_fh
+    entry = {
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'action': action,
+        'event_type': event_type,
+        'number': number,
+        'model': model,
+        'worker_id': worker_id,
+        'detail': detail,
+        'duration_seconds': duration_seconds,
+        'total_seconds': total_seconds,
+        'repo': repo or REPO,
+    }
+    entry = {k: v for k, v in entry.items() if v is not None}
+    try:
+        with _log_lock:
+            if _log_fh is None or _log_fh.closed:
+                _log_fh = open(_EVENTS_PATH, 'a', buffering=1)
+            _log_fh.write(json.dumps(entry) + '\n')
+    except Exception:
+        logging.debug('Failed to write event to %s', _EVENTS_PATH)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1871,11 +1902,14 @@ _PR_WINDOW_SECONDS = 600
 
 def dispatch(p):
     t = p.get('type')
+    received_at = time.time()
     logging.info(f'Event: {t}  repo={p.get("repo", "?")}')
+    log_event('received', event_type=t, number=p.get('number') or p.get('pr_number'))
 
     # Self-reply guard: skip bot's own comments (marker-based)
     if t == 'pr_comment' and '<!-- claude-agent -->' in p.get('comment_body', ''):
         logging.info(f'Skipping self-reply (marker detected)')
+        log_event('skipped', event_type=t, number=p.get('pr_number'), detail='self-reply-marker')
         return
 
     # Self-reply guard: visible signature (LLM reliably generates this even when marker is missing)
@@ -1883,16 +1917,19 @@ def dispatch(p):
         body = p.get('comment_body', '')
         if '\u00b7 claude-sonnet-' in body or '\u00b7 claude-opus-' in body:
             logging.info('Skipping self-reply (visible signature detected)')
+            log_event('skipped', event_type=t, number=p.get('pr_number'), detail='self-reply-signature')
             return
 
     # Closed/merged PR guard
     if t == 'pr_comment' and p.get('pr_state') == 'closed':
         logging.info(f'Skipping PR #{p.get("pr_number")} \u2014 closed/merged')
+        log_event('skipped', event_type=t, number=p.get('pr_number'), detail='pr-closed')
         return
 
     # claude-blocked label guard
     if t == 'pr_comment' and 'claude-blocked' in p.get('pr_labels', ''):
         logging.info(f'Skipping PR #{p.get("pr_number")} \u2014 claude-blocked label')
+        log_event('skipped', event_type=t, number=p.get('pr_number'), detail='claude-blocked')
         return
 
     # Circuit breaker: max N responses per PR per time window
@@ -1907,6 +1944,7 @@ def dispatch(p):
             _pr_response_count[pr_num] = (count, first_seen)
             if count > _PR_MAX_RESPONSES:
                 logging.warning(f'CIRCUIT BREAKER: {count} responses to PR #{pr_num} in {int(now - first_seen)}s \u2014 blocking')
+                log_event('skipped', event_type=t, number=pr_num, detail='circuit-breaker')
                 return
 
     # Dedup: prevent multiple workers for the same event
@@ -1918,12 +1956,14 @@ def dispatch(p):
     with _in_flight_lock:
         if key in _in_flight:
             logging.info(f'Skipping {key} — already in flight')
+            log_event('skipped', event_type=t, number=key[-1], detail='dedup-in-flight')
             return
         _in_flight.add(key)
 
     # claude-wip label guard: if the issue already has claude-wip, another worker claimed it
     if t == 'issue' and p.get('label') in ('claude-sonnet', 'claude-opus') and 'claude-wip' in p.get('issue_labels', ''):
         logging.info(f'Skipping issue #{p.get("number")} — already has claude-wip label')
+        log_event('skipped', event_type=t, number=p.get('number'), detail='already-wip')
         with _in_flight_lock:
             _in_flight.discard(key)
         return
@@ -1936,6 +1976,7 @@ def dispatch(p):
             session = SONNET_SESSION
             prompt  = triage_prompt(p)
             logging.info(f'Routing claude-ready issue #{p.get("number")} to triage')
+            log_event('routed', event_type=t, number=p.get('number'), detail='triage', model=model)
         elif label == 'claude-opus':
             model   = 'claude-opus-4-6'
             session = OPUS_SESSION
@@ -1955,6 +1996,7 @@ def dispatch(p):
         prompt  = pr_comment_prompt(p)
     else:
         logging.warning(f'Unknown event type: {t}')
+        log_event('skipped', event_type=t, detail='unknown-event-type')
         with _in_flight_lock:
             _in_flight.discard(key)
         return
@@ -1971,17 +2013,25 @@ def dispatch(p):
     ], capture_output=True, text=True)
     if spawn.returncode == 0:
         logging.info(f'Spawned {model} in {session}')
+        log_event('spawned', event_type=t, number=key[-1], model=model, worker_id=window_id)
         def _wait_and_expire():
+            start = time.time()
             subprocess.run(['tmux', 'wait-for', window_id], timeout=3600,
                            capture_output=True)
+            duration = round(time.time() - start, 1)
+            total = round(time.time() - received_at, 1)
+            log_event('done', event_type=t, number=key[-1], model=model,
+                      worker_id=window_id, duration_seconds=duration,
+                      total_seconds=total)
+            logging.info(f'Worker done, released {key} ({duration}s, total {total}s)')
             if t == 'issue':
                 time.sleep(60)  # cooldown: prevent rapid re-dispatch for same issue
             with _in_flight_lock:
                 _in_flight.discard(key)
-            logging.info(f'Worker done, released {key}')
         threading.Thread(target=_wait_and_expire, daemon=True).start()
     else:
         logging.error(f'Failed to open tmux window in {session} — is the session running?')
+        log_event('error', event_type=t, number=key[-1], detail='tmux-spawn-failed', model=model)
         with _in_flight_lock:
             _in_flight.discard(key)
 
@@ -2107,6 +2157,7 @@ Never force push.
 if __name__ == '__main__':
     server = http.server.HTTPServer(('', PORT), Handler)
     logging.info(f'Listening on :{PORT}  repo={REPO}  dual={DUAL_MODE}  sonnet={SONNET_SESSION}  opus={OPUS_SESSION}')
+    log_event('server_started', detail=f'port={PORT} dual={DUAL_MODE}')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
