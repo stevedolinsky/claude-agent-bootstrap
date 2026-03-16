@@ -1873,6 +1873,36 @@ def log_event(action, event_type=None, number=None, model=None,
         logging.debug('Failed to write event to %s', _EVENTS_PATH)
 
 
+def _heartbeat_loop():
+    """Emit live state every 30 seconds for the control tower dashboard."""
+    while True:
+        time.sleep(30)
+        try:
+            session_names = [SONNET_SESSION, 'claude-receiver']
+            if DUAL_MODE:
+                session_names.append(OPUS_SESSION)
+            sessions = {}
+            for name in session_names:
+                result = subprocess.run(
+                    ['tmux', 'has-session', '-t', name],
+                    capture_output=True, timeout=5
+                )
+                sessions[name] = result.returncode == 0
+            with _in_flight_lock:
+                in_flight = [
+                    {'type': k[0], 'number': k[-1]}
+                    for k in _in_flight
+                ]
+            log_event('heartbeat',
+                      detail=json.dumps({
+                          'sessions': sessions,
+                          'active_workers': len(in_flight),
+                          'in_flight': in_flight,
+                      }))
+        except Exception:
+            logging.debug('Heartbeat failed')
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 
@@ -2158,6 +2188,7 @@ if __name__ == '__main__':
     server = http.server.HTTPServer(('', PORT), Handler)
     logging.info(f'Listening on :{PORT}  repo={REPO}  dual={DUAL_MODE}  sonnet={SONNET_SESSION}  opus={OPUS_SESSION}')
     log_event('server_started', detail=f'port={PORT} dual={DUAL_MODE}')
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
