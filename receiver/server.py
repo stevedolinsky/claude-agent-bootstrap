@@ -283,6 +283,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     type="issue",
                     number=number,
                     queued_at=QueueItem.now_iso(),
+                    title=payload.get("title", ""),
+                    body=payload.get("body", ""),
                 )
 
             elif event_type == "issue_closed":

@@ -27,6 +27,8 @@ class QueueItem:
     priority: bool = False
     comment_id: int | None = None
     attempts: int = 0
+    title: str = ""
+    body: str = ""
 
     @staticmethod
     def now_iso() -> str:

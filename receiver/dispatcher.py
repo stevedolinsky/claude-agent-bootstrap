@@ -41,6 +41,7 @@ VALID_ACTIONS = frozenset({
     "blocked",
     "cost_tracked",
     "budget_exhausted",
+    "triage",
 })
 
 
@@ -328,8 +329,16 @@ class Dispatcher:
                 item.attempts + 1,
             )
 
-            # Select model based on issue complexity (simple heuristic)
+            # Select model via LLM triage
             model = self._select_model(item)
+
+            self._events.log(
+                "triage",
+                repo=repo,
+                number=item.number,
+                model=model,
+                complexity="complex" if "opus" in model else "simple",
+            )
 
             self._events.log(
                 "dispatched",
@@ -386,12 +395,69 @@ class Dispatcher:
         log.info("Dispatch loop exiting for %s", repo)
 
     def _select_model(self, item: QueueItem) -> str:
-        """Select model based on item type. Simple heuristic for v1."""
+        """Select model via LLM triage. Sonnet analyzes complexity, routes to Opus if needed."""
         # PR comments and maintenance always use Sonnet (fast/cheap)
         if item.type in ("pr_comment", "maintenance"):
             return "claude-sonnet-4-6"
-        # Default to Sonnet — dispatcher can be enhanced later
-        return "claude-sonnet-4-6"
+
+        # No content to analyze → default Sonnet
+        if not item.title and not item.body:
+            return "claude-sonnet-4-6"
+
+        return self._triage_issue(item)
+
+    def _triage_issue(self, item: QueueItem) -> str:
+        """Spawn a fast Sonnet call to classify issue complexity."""
+        triage_prompt = (
+            "You are a complexity classifier for GitHub issues. "
+            "Given the issue title and body, classify as SIMPLE or COMPLEX.\n\n"
+            "SIMPLE: bug fix, small feature, config change, docs update, style fix, "
+            "test addition, single-file change, clear implementation path.\n"
+            "COMPLEX: architecture change, multi-file refactor, security audit, "
+            "system design, migration, performance optimization, new subsystem, "
+            "cross-cutting concern, ambiguous requirements needing exploration.\n\n"
+            f"Issue title: {item.title}\n"
+            f"Issue body: {item.body[:2000]}\n\n"
+            "Reply with exactly one word: SIMPLE or COMPLEX"
+        )
+
+        try:
+            proc = subprocess.run(
+                [
+                    "claude",
+                    "--print",
+                    "--model", "claude-sonnet-4-6",
+                    "--max-turns", "1",
+                ],
+                input=triage_prompt,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            response = proc.stdout.strip().upper()
+            # Extract the classification word from the response
+            if "COMPLEX" in response:
+                model = "claude-opus-4-6"
+                log.info(
+                    "Triage: #%d classified as COMPLEX → opus",
+                    item.number,
+                )
+            else:
+                model = "claude-sonnet-4-6"
+                log.info(
+                    "Triage: #%d classified as SIMPLE → sonnet",
+                    item.number,
+                )
+
+            return model
+
+        except subprocess.TimeoutExpired:
+            log.warning("Triage timed out for #%d, defaulting to sonnet", item.number)
+            return "claude-sonnet-4-6"
+        except Exception:
+            log.exception("Triage failed for #%d, defaulting to sonnet", item.number)
+            return "claude-sonnet-4-6"
 
     def _run_worker(self, repo: str, item: QueueItem, model: str) -> WorkerResult:
         """Spawn worker subprocess and wait for completion."""
