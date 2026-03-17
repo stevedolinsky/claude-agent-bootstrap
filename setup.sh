@@ -186,30 +186,41 @@ main() {
     ok "Bootstrap complete!"
     echo ""
 
-    # Check if there are uncommitted workflow changes to push
-    local has_changes=false
-    if git diff --name-only --diff-filter=AM 2>/dev/null | grep -q ".github/workflows/"; then
-        has_changes=true
-    fi
-    if git ls-files --others --exclude-standard 2>/dev/null | grep -q ".github/workflows/"; then
-        has_changes=true
+    # Auto-commit and push workflow changes so GitHub sees them immediately.
+    # These are boilerplate config files (GHA workflows, CLAUDE.md, .claude/settings.json),
+    # not application code — safe to push directly.
+    local files_to_add=()
+    [[ -d ".github/workflows" ]] && files_to_add+=(".github/workflows/")
+    [[ -f "CLAUDE.md" ]] && files_to_add+=("CLAUDE.md")
+    [[ -d ".claude" ]] && files_to_add+=(".claude/")
+
+    if [[ ${#files_to_add[@]} -gt 0 ]]; then
+        git add "${files_to_add[@]}" 2>/dev/null
+
+        if ! git diff --cached --quiet 2>/dev/null; then
+            info "Pushing agent fleet config to GitHub..."
+            echo "  Files: ${files_to_add[*]}"
+            echo "  Why:   GitHub Actions need these workflow files on the remote to trigger on label events."
+            echo ""
+
+            git commit -m "chore: configure agent fleet workflows and settings" --no-verify 2>/dev/null
+            if git push 2>/dev/null; then
+                ok "Pushed to GitHub — workflows are live"
+            else
+                warn "Push failed — you may need to pull first:"
+                echo "  git pull --rebase && git push"
+            fi
+        else
+            info "No config changes to push — GitHub is up to date"
+        fi
     fi
 
-    if [[ "$has_changes" == "true" ]]; then
-        warn "Workflow files were updated — you MUST commit and push for GitHub to see them:"
-        echo ""
-        echo "  git add .github/workflows/ CLAUDE.md .claude/"
-        echo "  git commit -m \"chore: update agent fleet workflows\""
-        echo "  git push"
-        echo ""
-    fi
-
+    echo ""
     local secret_file="${HOME}/.claude/agent-webhook.secret"
     info "Deployment steps:"
-    echo "  1. Commit & push workflow changes (if any above)"
-    echo "  2. Start the dashboard:  cd ~/claude-agent-dashboard && ./start.sh"
-    echo "  3. Start the receiver:   cd ~/claude-agent-bootstrap && python3 -m receiver"
-    echo "  4. Label an issue with 'agent' to start the pipeline"
+    echo "  1. Start the dashboard:  cd ~/claude-agent-dashboard && ./start.sh"
+    echo "  2. Start the receiver:   cd ~/claude-agent-bootstrap && python3 -m receiver"
+    echo "  3. Label an issue with 'agent' to start the pipeline"
     echo ""
     if [[ -f "$secret_file" ]]; then
         info "GitHub secrets already configured — no changes needed."
