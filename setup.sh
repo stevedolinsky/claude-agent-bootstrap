@@ -82,20 +82,27 @@ detect_tailscale() {
 copy_templates() {
     info "Copying templates..."
 
-    # GHA workflows
+    # GHA workflows — only update if content changed
     mkdir -p .github/workflows
     for wf in "${TEMPLATES_DIR}"/workflows/*.yml; do
-        cp "$wf" ".github/workflows/$(basename "$wf")"
-        ok "  .github/workflows/$(basename "$wf")"
+        local name
+        name=$(basename "$wf")
+        local target=".github/workflows/${name}"
+        if [[ -f "$target" ]] && diff -q "$wf" "$target" &>/dev/null; then
+            info "  .github/workflows/${name} unchanged, skipping"
+        else
+            cp "$wf" "$target"
+            ok "  .github/workflows/${name}"
+        fi
     done
 
-    # .claude/settings.json
+    # .claude/settings.json — never overwrite (user may have customized permissions)
     mkdir -p .claude
     if [[ ! -f ".claude/settings.json" ]]; then
         cp "${TEMPLATES_DIR}/settings.json" ".claude/settings.json"
         ok "  .claude/settings.json"
     else
-        warn "  .claude/settings.json exists, skipping"
+        info "  .claude/settings.json exists, preserving"
     fi
 
     # CLAUDE.md
@@ -140,12 +147,13 @@ CONF
 setup_secret() {
     local secret_file="${HOME}/.claude/agent-webhook.secret"
     if [[ -f "$secret_file" ]]; then
-        info "Webhook secret exists at ${secret_file}"
+        ok "Webhook secret preserved at ${secret_file} (reusing existing)"
+        info "  Your existing GitHub secret AGENT_WEBHOOK_SECRET is still valid — no update needed"
     else
         mkdir -p "${HOME}/.claude"
         openssl rand -hex 32 > "$secret_file"
         chmod 600 "$secret_file"
-        ok "Generated webhook secret"
+        ok "Generated NEW webhook secret"
         echo ""
         warn "Add these GitHub repo secrets:"
         warn "  AGENT_WEBHOOK_SECRET = $(cat "$secret_file")"
@@ -177,11 +185,15 @@ main() {
     echo ""
     ok "Bootstrap complete!"
     echo ""
-    info "Next steps:"
-    echo "  1. Add GitHub secrets (AGENT_WEBHOOK_SECRET, TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET, AGENT_RECEIVER_HOST)"
-    echo "  2. Start receiver: python -m receiver"
-    echo "  3. Label an issue with 'agent'"
-    echo ""
+    local secret_file="${HOME}/.claude/agent-webhook.secret"
+    if [[ -f "$secret_file" ]]; then
+        info "Next steps:"
+        echo "  1. Start the dashboard:  cd ~/claude-agent-dashboard && ./start.sh"
+        echo "  2. Start the receiver:   python -m receiver"
+        echo "  3. Label an issue with 'agent' to start the pipeline"
+        echo ""
+        info "GitHub secrets already configured — no changes needed."
+    fi
 }
 
 main "$@"
