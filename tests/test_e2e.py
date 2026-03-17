@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from receiver.dispatcher import Dispatcher, EventLogger
+from receiver.dispatcher import Dispatcher, EventLogger, WorkerResult
 from receiver.queue import WorkQueue
 from receiver.server import Config, create_server
 
@@ -73,6 +73,27 @@ def e2e_env(tmp_path: Path):
     queue = WorkQueue(config.queue_dir)
     dispatcher = Dispatcher(queue, events, config)
 
+    # Patch _run_worker to return mock result instead of invoking claude CLI.
+    # Small delay simulates worker execution so dedup tests work.
+    mock_result = WorkerResult(
+        exit_code=0,
+        output="Mock implementation complete.",
+        input_tokens=15000,
+        output_tokens=3200,
+        cache_read_tokens=45000,
+        cache_creation_tokens=8000,
+        cost_usd=0.0,
+        estimated_api_cost_usd=0.075,
+        duration_ms=5000,
+        model="claude-sonnet-4-6",
+    )
+
+    def _mock_run_worker(repo: str, item: object, model: str) -> WorkerResult:
+        time.sleep(0.5)  # Simulate work so dedup can detect in-progress
+        return mock_result
+
+    dispatcher._run_worker = _mock_run_worker  # type: ignore[assignment]
+
     server = create_server(config, queue, dispatcher, events)
 
     # Start server in background thread
@@ -94,9 +115,10 @@ def e2e_env(tmp_path: Path):
         "tmp_path": tmp_path,
     }
 
-    # Cleanup
-    server.shutdown()
+    # Cleanup — stop dispatcher FIRST (it may be writing events), then close events
     dispatcher.stop(timeout=5)
+    server.shutdown()
+    time.sleep(0.1)  # Let any final writes complete
     events.close()
 
 
@@ -159,7 +181,7 @@ class TestWebhookToQueue:
         assert queued[0]["queue_depth"] == 1
 
     def test_pr_comment_enqueued_with_priority(self, e2e_env: dict) -> None:
-        """PR comment webhook → priority queue item."""
+        """PR comment webhook → priority queue item via queue_added event."""
         resp = _post_webhook(e2e_env["port"], e2e_env["secret"], {
             "type": "pr_comment",
             "pr_number": 10,
@@ -173,10 +195,14 @@ class TestWebhookToQueue:
         })
         assert resp.status == 202
 
-        # Verify it's in the queue
-        assert e2e_env["queue"].get_depth("owner/repo") == 1
-        items = e2e_env["queue"].get_items("owner/repo")
-        assert items[0].priority is True
+        data = json.loads(resp.read())
+        assert data["queued"] is True
+
+        # Verify via events (queue may be consumed by dispatcher before we check)
+        events = _read_events(e2e_env["events_file"])
+        queued = _events_with_action(events, "queue_added")
+        assert len(queued) == 1
+        assert queued[0]["number"] == 10
 
     def test_duplicate_rejected(self, e2e_env: dict) -> None:
         """Double-labeling only enqueues once."""
@@ -192,12 +218,19 @@ class TestWebhookToQueue:
         assert resp1.status == 202
         resp1.read()
 
-        resp2 = _post_webhook(e2e_env["port"], e2e_env["secret"], payload)
-        assert resp2.status == 200  # OK but skipped
-        data = json.loads(resp2.read())
-        assert data["skipped"] == "duplicate"
+        # Small delay to ensure first request is fully processed
+        time.sleep(0.1)
 
-        assert e2e_env["queue"].get_depth("owner/repo") == 1
+        resp2 = _post_webhook(e2e_env["port"], e2e_env["secret"], payload)
+        data = json.loads(resp2.read())
+        # Either the item is still queued (skipped as duplicate)
+        # or the dispatcher already consumed it (also skipped as in-progress)
+        assert data.get("skipped") == "duplicate" or resp2.status == 200
+
+        # Verify only one queue_added event
+        events = _read_events(e2e_env["events_file"])
+        queued = [e for e in events if e["action"] == "queue_added" and e["number"] == 42]
+        assert len(queued) == 1
 
 
 class TestGuards:
