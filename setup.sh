@@ -204,11 +204,13 @@ main() {
             echo ""
 
             git commit -m "chore: configure agent fleet workflows and settings" --no-verify 2>/dev/null
-            if git push 2>/dev/null; then
-                ok "Pushed to GitHub — workflows are live"
+            local branch
+            branch=$(git branch --show-current)
+            if git push -u origin "$branch" 2>/dev/null; then
+                ok "Pushed to GitHub — workflows are live on '${branch}'"
             else
-                warn "Push failed — you may need to pull first:"
-                echo "  git pull --rebase && git push"
+                warn "Push failed. Try:"
+                echo "  git pull origin ${branch} --rebase && git push -u origin ${branch}"
             fi
         else
             info "No config changes to push — GitHub is up to date"
