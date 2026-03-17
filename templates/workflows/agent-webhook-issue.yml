@@ -12,6 +12,20 @@ jobs:
       !contains(join(github.event.issue.labels.*.name, ','), 'agent-blocked')
     runs-on: ubuntu-latest
     steps:
+      - name: Validate secrets
+        env:
+          AGENT_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          RECEIVER_HOST: ${{ secrets.AGENT_RECEIVER_HOST }}
+        run: |
+          missing=""
+          [ -z "$AGENT_SECRET" ] && missing="${missing} AGENT_WEBHOOK_SECRET"
+          [ -z "$RECEIVER_HOST" ] && missing="${missing} AGENT_RECEIVER_HOST"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required GitHub secrets:${missing}"
+            echo "Add them at: Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
@@ -31,7 +45,7 @@ jobs:
         run: |
           echo "::add-mask::$AGENT_SECRET"
 
-          # Build payload — all values come from env vars (safe from shell injection)
+          # Build payload — all values from env vars (safe from shell injection)
           PAYLOAD=$(jq -n \
             --arg type "issue" \
             --argjson number "$ISSUE_NUMBER" \
@@ -44,10 +58,25 @@ jobs:
           # Compute HMAC-SHA256 signature
           SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$AGENT_SECRET" | awk '{print $2}')"
 
+          echo "Sending webhook to ${RECEIVER_HOST}:9876..."
+
           # POST to receiver
-          curl -s -X POST "http://${RECEIVER_HOST}:9876/webhook" \
+          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+            -X POST "http://${RECEIVER_HOST}:9876/webhook" \
             -H "Content-Type: application/json" \
             -H "X-Agent-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
             --max-time 10 \
-            --retry 2
+            --retry 2) || true
+
+          RESPONSE=$(cat /tmp/response.txt 2>/dev/null || echo "no response")
+
+          if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "Webhook delivered (HTTP $HTTP_CODE): $RESPONSE"
+          elif [ -z "$HTTP_CODE" ] || [ "$HTTP_CODE" = "000" ]; then
+            echo "::error::Could not connect to receiver at ${RECEIVER_HOST}:9876. Is the receiver running? (cd ~/claude-agent-bootstrap && python3 -m receiver)"
+            exit 1
+          else
+            echo "::error::Receiver returned HTTP $HTTP_CODE: $RESPONSE"
+            exit 1
+          fi
