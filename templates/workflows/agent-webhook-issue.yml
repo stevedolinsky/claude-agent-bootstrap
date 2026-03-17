@@ -23,18 +23,22 @@ jobs:
         env:
           AGENT_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
           RECEIVER_HOST: ${{ secrets.AGENT_RECEIVER_HOST }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_REPO: ${{ github.repository }}
+          ISSUE_LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
-          # Mask secret in logs
           echo "::add-mask::$AGENT_SECRET"
 
-          # Build payload
+          # Build payload — all values come from env vars (safe from shell injection)
           PAYLOAD=$(jq -n \
             --arg type "issue" \
-            --argjson number '${{ github.event.issue.number }}' \
-            --arg title '${{ github.event.issue.title }}' \
-            --arg body '${{ github.event.issue.body }}' \
-            --arg repo '${{ github.repository }}' \
-            --argjson labels '$(echo '${{ toJSON(github.event.issue.labels.*.name) }}')' \
+            --argjson number "$ISSUE_NUMBER" \
+            --arg title "$ISSUE_TITLE" \
+            --arg body "$ISSUE_BODY" \
+            --arg repo "$ISSUE_REPO" \
+            --argjson labels "$ISSUE_LABELS" \
             '{type: $type, number: $number, title: $title, body: $body, repo: $repo, labels: $labels}')
 
           # Compute HMAC-SHA256 signature
