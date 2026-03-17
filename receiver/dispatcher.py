@@ -278,9 +278,15 @@ class Dispatcher:
     def stop(self, timeout: float = 30.0) -> None:
         """Signal all loops to exit and join threads."""
         self._shutdown.set()
+        # Wake all dispatch loops so they see the shutdown flag immediately
+        for repo in list(self._queue.repos()) + list(self._repo_threads.keys()):
+            self._queue.wait_for_work(repo, timeout=0)  # Ensure event exists
+            self._queue._events.get(repo, threading.Event()).set()
         for repo, thread in self._repo_threads.items():
             log.info("Waiting for dispatch loop %s to exit...", repo)
-            thread.join(timeout=timeout)
+            thread.join(timeout=timeout / max(len(self._repo_threads), 1))
+            if thread.is_alive():
+                log.warning("Dispatch loop %s did not exit cleanly", repo)
 
     def start_heartbeat(self) -> threading.Thread:
         """Start heartbeat emission thread."""
@@ -307,7 +313,7 @@ class Dispatcher:
 
             if self._budget_exhausted:
                 log.warning("Budget exhausted, dispatch paused for %s", repo)
-                time.sleep(60)
+                self._shutdown.wait(60)  # Interruptible sleep
                 continue
 
             item = self._queue.take_next(repo)
