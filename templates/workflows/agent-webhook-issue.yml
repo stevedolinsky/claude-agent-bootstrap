@@ -1,0 +1,49 @@
+name: Agent Webhook — Issue Labeled
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  notify-receiver:
+    if: |
+      github.event.label.name == 'agent' &&
+      !contains(join(github.event.issue.labels.*.name, ','), 'agent-wip') &&
+      !contains(join(github.event.issue.labels.*.name, ','), 'agent-blocked')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Send webhook to receiver
+        env:
+          AGENT_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          RECEIVER_HOST: ${{ secrets.AGENT_RECEIVER_HOST }}
+        run: |
+          # Mask secret in logs
+          echo "::add-mask::$AGENT_SECRET"
+
+          # Build payload
+          PAYLOAD=$(jq -n \
+            --arg type "issue" \
+            --argjson number '${{ github.event.issue.number }}' \
+            --arg title '${{ github.event.issue.title }}' \
+            --arg body '${{ github.event.issue.body }}' \
+            --arg repo '${{ github.repository }}' \
+            --argjson labels '$(echo '${{ toJSON(github.event.issue.labels.*.name) }}')' \
+            '{type: $type, number: $number, title: $title, body: $body, repo: $repo, labels: $labels}')
+
+          # Compute HMAC-SHA256 signature
+          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$AGENT_SECRET" | awk '{print $2}')"
+
+          # POST to receiver
+          curl -s -X POST "http://${RECEIVER_HOST}:9876/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Agent-Signature: $SIGNATURE" \
+            -d "$PAYLOAD" \
+            --max-time 10 \
+            --retry 2

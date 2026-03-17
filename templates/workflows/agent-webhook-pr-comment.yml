@@ -1,0 +1,64 @@
+name: Agent Webhook — PR Comment
+
+on:
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+jobs:
+  notify-receiver:
+    # Only fire for PR comments (issue_comment fires for both issues and PRs)
+    if: |
+      (github.event_name == 'pull_request_review_comment' ||
+       (github.event_name == 'issue_comment' && github.event.issue.pull_request)) &&
+      !contains(github.event.comment.user.login, '[bot]') &&
+      !contains(github.event.comment.body, '<!-- claude-agent -->') &&
+      !contains(github.event.comment.body, '· claude-sonnet-') &&
+      !contains(github.event.comment.body, '· claude-opus-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Send webhook to receiver
+        env:
+          AGENT_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          RECEIVER_HOST: ${{ secrets.AGENT_RECEIVER_HOST }}
+        run: |
+          echo "::add-mask::$AGENT_SECRET"
+
+          # Determine PR number and branch
+          if [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+            PR_STATE="${{ github.event.pull_request.state }}"
+          else
+            PR_NUMBER="${{ github.event.issue.number }}"
+            PR_BRANCH=""
+            PR_STATE="${{ github.event.issue.state }}"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg type "pr_comment" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg comment_body '${{ github.event.comment.body }}' \
+            --arg comment_author '${{ github.event.comment.user.login }}' \
+            --arg pr_branch "$PR_BRANCH" \
+            --arg repo '${{ github.repository }}' \
+            --arg pr_state "$PR_STATE" \
+            --argjson comment_id '${{ github.event.comment.id }}' \
+            '{type: $type, pr_number: $pr_number, number: $pr_number, comment_body: $comment_body, comment_author: $comment_author, pr_branch: $pr_branch, repo: $repo, pr_state: $pr_state, comment_id: $comment_id}')
+
+          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$AGENT_SECRET" | awk '{print $2}')"
+
+          curl -s -X POST "http://${RECEIVER_HOST}:9876/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Agent-Signature: $SIGNATURE" \
+            -d "$PAYLOAD" \
+            --max-time 10 \
+            --retry 2
