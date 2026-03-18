@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 class QueueItem:
     """A single work item in the queue."""
 
-    type: Literal["issue", "pr_comment", "maintenance"]
+    type: Literal["issue", "pr_comment", "issue_comment", "maintenance"]
     number: int
     queued_at: str  # ISO 8601
     priority: bool = False
@@ -29,6 +29,13 @@ class QueueItem:
     attempts: int = 0
     title: str = ""
     body: str = ""
+
+    @property
+    def dedup_key(self) -> tuple:
+        """Dedup key: (type, number, comment_id) for comments, (type, number) otherwise."""
+        if self.comment_id is not None:
+            return (self.type, self.number, self.comment_id)
+        return (self.type, self.number)
 
     @staticmethod
     def now_iso() -> str:
@@ -66,11 +73,11 @@ class WorkQueue:
         """Add item to repo's queue. Returns False if duplicate."""
         lock = self._ensure_repo(repo)
         with lock:
-            key = (item.type, item.number)
+            key = item.dedup_key
 
             # Dedup: reject if already queued or in-progress
             for existing in self._queues[repo]:
-                if (existing.type, existing.number) == key:
+                if existing.dedup_key == key:
                     log.debug("dedup: %s already queued for %s", key, repo)
                     return False
             if key in self._in_progress[repo]:
@@ -101,15 +108,15 @@ class WorkQueue:
                 0,
             )
             item = items.pop(idx)
-            self._in_progress[repo].add((item.type, item.number))
+            self._in_progress[repo].add(item.dedup_key)
             self._persist(repo)
             return item
 
-    def complete(self, repo: str, item_type: str, number: int) -> None:
+    def complete(self, repo: str, dedup_key: tuple) -> None:
         """Remove item from in-progress tracking."""
         lock = self._ensure_repo(repo)
         with lock:
-            self._in_progress[repo].discard((item_type, number))
+            self._in_progress[repo].discard(dedup_key)
 
     def cancel(self, repo: str, issue_number: int) -> bool:
         """Remove item by issue number. Returns True if found."""
@@ -130,7 +137,7 @@ class WorkQueue:
         """Add item to front of queue (for epic continuation)."""
         lock = self._ensure_repo(repo)
         with lock:
-            self._in_progress[repo].discard((item.type, item.number))
+            self._in_progress[repo].discard(item.dedup_key)
             self._queues[repo].insert(0, item)
             self._persist(repo)
         self._events[repo].set()
