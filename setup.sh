@@ -220,8 +220,9 @@ main() {
     echo ""
     local secret_file="${HOME}/.claude/agent-webhook.secret"
     info "Deployment steps:"
-    echo "  1. Start the receiver:   cd ${SCRIPT_DIR} && python3 -m receiver"
-    echo "  2. Label an issue with 'agent' to start the pipeline"
+    echo "  1. Start the dashboard:  cd ~/claude-agent-dashboard && ./start.sh"
+    echo "  2. Start the receiver:   cd ${SCRIPT_DIR} && python3 -m receiver"
+    echo "  3. Label an issue with 'agent' to start the pipeline"
     echo ""
     if [[ -f "$secret_file" ]]; then
         info "GitHub secrets already configured — no changes needed."
