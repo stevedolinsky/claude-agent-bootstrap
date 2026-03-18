@@ -1,3 +1,1 @@
-# No external dependencies — stdlib only for v1
-# Development dependencies:
-# pip install pytest
+prometheus_client>=0.21.0

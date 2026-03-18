@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .dispatcher import Dispatcher, EventLogger
+from . import metrics as prom
 from .queue import WorkQueue
 from .server import Config, create_server
 
@@ -67,6 +68,10 @@ def main() -> None:
     # Setup
     config.ensure_dirs()
     config.validate_permissions()
+
+    # Initialize Prometheus metrics (restore persisted counters)
+    prom.load_state()
+    prom.setup_persistence()
 
     # Initialize components
     events = EventLogger(config.events_file)
