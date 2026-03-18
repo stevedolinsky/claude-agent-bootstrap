@@ -246,6 +246,8 @@ All events are logged to `~/.claude/agent-events.jsonl` in structured JSONL form
 
 Heartbeat events emit queue depth, daily cost, and worker count every 30 seconds.
 
+For a visual dashboard that reads these events, see [claude-agent-dashboard](https://github.com/stevedolinsky/claude-agent-dashboard).
+
 ### Generated Files
 
 `setup.sh` creates these files in your target repo:
