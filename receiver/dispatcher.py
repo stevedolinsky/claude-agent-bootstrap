@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import BudgetExhaustedError, WorkerSpawnError, WorkerTimeoutError
+from . import metrics as prom
 from .queue import QueueItem, WorkQueue
 from .server import Config, LABELS, record_circuit_breaker
 
@@ -369,6 +370,12 @@ class Dispatcher:
                         model=model,
                         duration_seconds=result.duration_ms / 1000,
                     )
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="done", reason="").inc()
+                    prom.IN_FLIGHT.labels(repo=repo).dec()
+                    prom.QUEUE_DEPTH.labels(repo=repo).dec()
+                    prom.WORKER_DURATION.labels(repo=repo, model=model).observe(
+                        result.duration_ms / 1000
+                    )
                 else:
                     self._handle_failure(repo, item, result, model)
 
@@ -379,6 +386,9 @@ class Dispatcher:
                     number=item.number,
                     block_reason="worker_timeout",
                 )
+                prom.ISSUES_TOTAL.labels(repo=repo, action="blocked", reason="worker_timeout").inc()
+                prom.IN_FLIGHT.labels(repo=repo).dec()
+                prom.QUEUE_DEPTH.labels(repo=repo).dec()
                 self._queue.complete(repo, item.dedup_key)
                 log.error("Worker timed out for %s #%d", repo, item.number)
 
@@ -389,6 +399,9 @@ class Dispatcher:
                     number=item.number,
                     detail=str(exc),
                 )
+                prom.ISSUES_TOTAL.labels(repo=repo, action="error", reason=str(exc)[:50]).inc()
+                prom.IN_FLIGHT.labels(repo=repo).dec()
+                prom.QUEUE_DEPTH.labels(repo=repo).dec()
                 self._queue.complete(repo, item.dedup_key)
 
             except BudgetExhaustedError:
@@ -480,6 +493,8 @@ class Dispatcher:
             number=item.number,
             model=model,
         )
+        prom.ISSUES_TOTAL.labels(repo=repo, action="spawned", reason="").inc()
+        prom.IN_FLIGHT.labels(repo=repo).inc()
 
         # Write prompt to temp file for stdin
         with tempfile.NamedTemporaryFile(
@@ -630,6 +645,20 @@ class Dispatcher:
                 daily_cumulative_usd=round(self._budget.estimated_cost_usd, 6),
             )
 
+            # Prometheus metrics
+            prom.COST_TOTAL.labels(repo=repo, model=result.model).inc(
+                result.estimated_api_cost_usd
+            )
+            for token_type, count in [
+                ("input", result.input_tokens),
+                ("output", result.output_tokens),
+                ("cache_read", result.cache_read_tokens),
+                ("cache_create", result.cache_creation_tokens),
+            ]:
+                if count:
+                    prom.TOKENS_TOTAL.labels(repo=repo, model=result.model, type=token_type).inc(count)
+            prom.save_state()
+
             if self._budget.estimated_cost_usd >= self._config.daily_budget_usd:
                 self._budget_exhausted = True
                 self._events.log(
@@ -664,5 +693,11 @@ class Dispatcher:
                     daily_budget_usd=daily_budget,
                     daily_workers=daily_workers,
                 )
+
+            # Persist Prometheus counter state alongside heartbeat
+            try:
+                prom.save_state()
+            except Exception:
+                log.exception("Failed to save metrics state")
 
             self._shutdown.wait(self._config.heartbeat_interval)

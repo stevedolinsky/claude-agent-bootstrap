@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import WebhookAuthError
+from . import metrics as prom
+from .metrics import generate_latest, CONTENT_TYPE_LATEST
 from .queue import QueueItem
 
 if TYPE_CHECKING:
@@ -212,6 +214,22 @@ class WebhookHandler(BaseHTTPRequestHandler):
     secret: bytes
     config: Config
 
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/metrics":
+            data = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self) -> None:  # noqa: N802
         try:
             content_length = int(self.headers.get("Content-Length", 0))
@@ -242,6 +260,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 event_type=event_type,
                 number=number,
             )
+            prom.ISSUES_TOTAL.labels(repo=repo, action="received", reason="").inc()
 
             # 4. Run guards and route
             if event_type == "pr_comment":
@@ -339,6 +358,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 number=item.number,
                 queue_depth=depth,
             )
+            prom.QUEUE_DEPTH.labels(repo=repo).set(depth)
+            prom.ISSUES_TOTAL.labels(repo=repo, action="queue_added", reason="").inc()
 
             # 6. Notify dispatcher
             self.dispatcher.ensure_repo_loop(repo)
