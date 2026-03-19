@@ -29,7 +29,7 @@ touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
 
 cd "$SCRIPT_DIR"
-"${SCRIPT_DIR}/.venv/bin/python" -m receiver >> "$LOG_FILE" 2>&1 &
+"${SCRIPT_DIR}/.venv/bin/python" -m receiver >> "$LOG_FILE" 2>&1 200>&- &
 echo $! > "$PID_FILE"
 
 # Verify startup succeeded
