@@ -165,6 +165,12 @@ class WorkQueue:
         event.clear()
         return result
 
+    def wake(self, repo: str) -> None:
+        """Wake any thread waiting on this repo's event."""
+        event = self._events.get(repo)
+        if event is not None:
+            event.set()
+
     # --- Internals ---
 
     def _ensure_repo(self, repo: str) -> threading.Lock:
