@@ -10,7 +10,6 @@ import atexit
 import json
 import logging
 import os
-import signal
 import tempfile
 import threading
 
@@ -134,11 +133,5 @@ def load_state() -> None:
 
 
 def setup_persistence() -> None:
-    """Register shutdown hooks to save state on exit."""
+    """Register atexit hook to save state on exit (safety net)."""
     atexit.register(save_state)
-
-    def _handle_sigterm(signum: int, frame: object) -> None:
-        save_state()
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)

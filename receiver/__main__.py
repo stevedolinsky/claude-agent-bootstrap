@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import signal
-import sys
+import threading
 from pathlib import Path
 
 from .dispatcher import Dispatcher, EventLogger
@@ -14,6 +14,8 @@ from .queue import WorkQueue
 from .server import Config, create_server
 
 log = logging.getLogger("receiver")
+
+_shutdown_event = threading.Event()
 
 
 def main() -> None:
@@ -81,13 +83,9 @@ def main() -> None:
     # Create server
     server = create_server(config, queue, dispatcher, events)
 
-    # Graceful shutdown
+    # Signal handler: only set event (async-signal-safe — no locks, no I/O)
     def shutdown_handler(signum: int, frame: object) -> None:
-        log.info("Received signal %d, shutting down...", signum)
-        server.shutdown()
-        dispatcher.stop(timeout=30.0)
-        events.close()
-        sys.exit(0)
+        _shutdown_event.set()
 
     signal.signal(signal.SIGTERM, shutdown_handler)
     signal.signal(signal.SIGINT, shutdown_handler)
@@ -95,22 +93,28 @@ def main() -> None:
     # Start heartbeat
     dispatcher.start_heartbeat()
 
-    # Run server
+    # Run server in daemon thread (required by socketserver threading contract)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
     log.info(
         "Receiver started on %s:%d (daily budget: $%.2f)",
         config.bind_address,
         config.port,
         config.daily_budget_usd,
     )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.shutdown()
-        dispatcher.stop()
-        events.close()
-        log.info("Receiver stopped")
+
+    # Main thread blocks until signal
+    _shutdown_event.wait()
+
+    # All cleanup in normal code flow — locks are safe here
+    log.info("Shutting down...")
+    server.shutdown()
+    server.server_close()
+    dispatcher.stop(timeout=30.0)
+    prom.save_state()
+    events.close()
+    log.info("Receiver stopped")
 
 
 if __name__ == "__main__":

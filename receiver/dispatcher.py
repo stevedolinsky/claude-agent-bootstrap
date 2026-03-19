@@ -75,7 +75,8 @@ class EventLogger:
 
     def close(self) -> None:
         with self._lock:
-            self._file.close()
+            if not self._file.closed:
+                self._file.close()
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +256,7 @@ class Dispatcher:
         self._budget_exhausted = False
 
         self._repo_threads: dict[str, threading.Thread] = {}
+        self._heartbeat_thread: threading.Thread | None = None
         self._budget = load_budget(config.budget_file)
         self._budget_lock = threading.Lock()
 
@@ -278,17 +280,43 @@ class Dispatcher:
         # The enqueue already signals the event via queue.enqueue()
 
     def stop(self, timeout: float = 30.0) -> None:
-        """Signal all loops to exit and join threads."""
+        """Signal all loops to exit, kill workers, and join threads."""
         self._shutdown.set()
+
         # Wake all dispatch loops so they see the shutdown flag immediately
         for repo in list(self._queue.repos()) + list(self._repo_threads.keys()):
-            self._queue.wait_for_work(repo, timeout=0)  # Ensure event exists
-            self._queue._events.get(repo, threading.Event()).set()
+            self._queue.wake(repo)
+
+        # Terminate in-flight workers via existing PID files
+        for pid_file in self._config.workers_dir.glob("*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)  # Verify process exists before killpg
+                os.killpg(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError, ValueError):
+                pass
+
+        # Join dispatch threads with shared deadline
+        deadline = time.monotonic() + timeout
         for repo, thread in self._repo_threads.items():
+            remaining = max(0.1, deadline - time.monotonic())
             log.info("Waiting for dispatch loop %s to exit...", repo)
-            thread.join(timeout=timeout / max(len(self._repo_threads), 1))
+            thread.join(timeout=remaining)
             if thread.is_alive():
                 log.warning("Dispatch loop %s did not exit cleanly", repo)
+
+        # Join heartbeat thread
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=5.0)
+
+        # SIGKILL any workers that survived SIGTERM
+        for pid_file in self._config.workers_dir.glob("*.pid"):
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)  # Still alive?
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError, ValueError):
+                pass
 
     def start_heartbeat(self) -> threading.Thread:
         """Start heartbeat emission thread."""
@@ -298,6 +326,7 @@ class Dispatcher:
             daemon=True,
         )
         t.start()
+        self._heartbeat_thread = t
         return t
 
     # --- Dispatch loop ---
@@ -512,15 +541,16 @@ class Dispatcher:
                 "--max-budget-usd", str(self._config.per_worker_budget_usd),
             ]
 
-            proc = subprocess.Popen(
-                cmd,
-                stdin=open(prompt_file),  # noqa: SIM115
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,
-            )
+            with open(prompt_file) as stdin_file:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=stdin_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
 
-            # Write PID file
+            # Write PID file (PGID == PID due to start_new_session)
             pid_file = self._config.workers_dir / f"{repo.replace('/', '-')}.pid"
             pid_file.parent.mkdir(parents=True, exist_ok=True)
             pid_file.write_text(str(proc.pid))
@@ -528,13 +558,13 @@ class Dispatcher:
             try:
                 stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                # Two-phase termination
+                # Two-phase termination via process group
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    os.killpg(proc.pid, signal.SIGTERM)
                     proc.wait(timeout=10)
                 except (subprocess.TimeoutExpired, ProcessLookupError):
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        os.killpg(proc.pid, signal.SIGKILL)
                         proc.wait()
                     except ProcessLookupError:
                         pass

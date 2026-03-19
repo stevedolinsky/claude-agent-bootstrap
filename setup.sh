@@ -160,6 +160,45 @@ setup_secret() {
 }
 
 # ---------------------------------------------------------------------------
+# 5. Interactive Post-Bootstrap
+# ---------------------------------------------------------------------------
+
+maybe_start_dashboard() {
+    if [[ ! -t 0 ]]; then return; fi  # Non-interactive: skip
+
+    echo ""
+    local answer
+    read -rp "  Start the monitoring dashboard? (Grafana + Loki) [y/N] " answer || answer=""
+    [[ "${answer,,}" == "y" ]] || return 0
+
+    local dashboard_dir="${HOME}/claude-agent-dashboard"
+    if [[ ! -d "$dashboard_dir" ]]; then
+        read -rp "  Dashboard repo not found. Clone it? [y/N] " answer || answer=""
+        [[ "${answer,,}" == "y" ]] || return 0
+        git clone https://github.com/stevedolinsky/claude-agent-dashboard.git "$dashboard_dir" 2>/dev/null \
+            && ok "Cloned dashboard to ${dashboard_dir}" \
+            || { warn "Failed to clone dashboard repo"; return 0; }
+    fi
+
+    (cd "$dashboard_dir" && ./start.sh) \
+        && ok "Dashboard started" \
+        || warn "Dashboard start failed — run manually: cd $dashboard_dir && ./start.sh"
+}
+
+maybe_start_receiver() {
+    if [[ ! -t 0 ]]; then return; fi  # Non-interactive: skip
+
+    echo ""
+    local answer
+    read -rp "  Start the webhook receiver? [y/N] " answer || answer=""
+    [[ "${answer,,}" == "y" ]] || return 0
+
+    "${SCRIPT_DIR}/start.sh" \
+        && ok "Receiver started" \
+        || warn "Receiver start failed — run manually: ${SCRIPT_DIR}/start.sh"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -215,13 +254,19 @@ main() {
         fi
     fi
 
+    # Interactive post-bootstrap: start dashboard and receiver
+    maybe_start_dashboard
+    maybe_start_receiver
+
+    echo ""
+    info "Next step: Label an issue with 'agent' to start the pipeline"
+    echo ""
+    echo "  Lifecycle commands:"
+    echo "    Start receiver:  ${SCRIPT_DIR}/start.sh"
+    echo "    Stop receiver:   ${SCRIPT_DIR}/stop.sh"
+    echo "    Check status:    ${SCRIPT_DIR}/status.sh"
     echo ""
     local secret_file="${HOME}/.claude/agent-webhook.secret"
-    info "Deployment steps:"
-    echo "  1. Start the dashboard:  cd ~/claude-agent-dashboard && ./start.sh"
-    echo "  2. Start the receiver:   cd ${SCRIPT_DIR} && python3 -m receiver"
-    echo "  3. Label an issue with 'agent' to start the pipeline"
-    echo ""
     if [[ -f "$secret_file" ]]; then
         info "GitHub secrets already configured — no changes needed."
     fi
