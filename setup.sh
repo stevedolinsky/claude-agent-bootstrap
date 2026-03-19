@@ -113,11 +113,9 @@ copy_templates() {
         warn "  CLAUDE.md already configured, skipping"
     else
         local content
-        content=$(sed \
-            -e "s|{{verify_chain}}|${VERIFY_CHAIN}|g" \
-            -e "s|{{events_file}}|${events_file}|g" \
-            -e "s|{{plans_dir}}|${plans_dir}|g" \
-            "${TEMPLATES_DIR}/claude-md-append.md")
+        content=$(VERIFY_CHAIN="$VERIFY_CHAIN" EVENTS_FILE="$events_file" PLANS_DIR="$plans_dir" \
+            envsubst '${VERIFY_CHAIN} ${EVENTS_FILE} ${PLANS_DIR}' \
+            < "${TEMPLATES_DIR}/claude-md-append.md")
 
         if [[ -f "CLAUDE.md" ]]; then
             echo "" >> CLAUDE.md

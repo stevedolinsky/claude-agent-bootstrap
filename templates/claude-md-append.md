@@ -4,7 +4,7 @@
 ### Verify Chain
 Run after every code change:
 ```
-{{verify_chain}}
+${VERIFY_CHAIN}
 ```
 
 ### Git Conventions
@@ -31,13 +31,13 @@ Use MCP tools for ALL GitHub operations. Do NOT use `gh` CLI — it is not insta
 - `mcp__github__add_issue_comment` for commenting
 
 ### Event Logging
-Append structured events to `{{events_file}}` using this format:
+Append structured events to `${EVENTS_FILE}` using this format:
 ```bash
-echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","action":"ACTION","repo":"REPO","number":N,...}' >> {{events_file}}
+echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","action":"ACTION","repo":"REPO","number":N,...}' >> ${EVENTS_FILE}
 ```
 
 Valid actions: `plan_created`, `step_started`, `step_completed`, `pr_created`
 
 ### Epic Plan Files
-Epic decomposition plans are stored at `{{plans_dir}}/epic-<number>.json`.
+Epic decomposition plans are stored at `${PLANS_DIR}/epic-<number>.json`.
 The dispatcher owns plan file writes — workers emit events, dispatcher updates the plan.
