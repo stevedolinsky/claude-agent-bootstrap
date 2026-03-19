@@ -1,17 +1,14 @@
-name: Agent Webhook — PR Comment
+name: Agent Webhook — Issue Comment
 
 on:
-  pull_request_review_comment:
-    types: [created]
   issue_comment:
     types: [created]
 
 jobs:
   notify-receiver:
-    # Only fire for PR comments (issue_comment fires for both issues and PRs)
+    # Only fire for non-PR issue comments (PR comments handled by agent-webhook-pr-comment)
     if: |
-      (github.event_name == 'pull_request_review_comment' ||
-       (github.event_name == 'issue_comment' && github.event.issue.pull_request)) &&
+      !github.event.issue.pull_request &&
       !contains(github.event.comment.user.login, '[bot]') &&
       !contains(github.event.comment.body, '<!-- claude-agent -->') &&
       !contains(github.event.comment.body, '· claude-sonnet-') &&
@@ -43,11 +40,9 @@ jobs:
         env:
           AGENT_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
           RECEIVER_HOST: ${{ secrets.AGENT_RECEIVER_HOST }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER_REVIEW: ${{ github.event.pull_request.number }}
-          PR_BRANCH_REVIEW: ${{ github.event.pull_request.head.ref }}
-          PR_STATE_REVIEW: ${{ github.event.pull_request.state }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_STATE: ${{ github.event.issue.state }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
@@ -57,28 +52,18 @@ jobs:
         run: |
           echo "::add-mask::$AGENT_SECRET"
 
-          # Determine PR number and branch based on event type
-          if [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
-            PR_NUMBER="$PR_NUMBER_REVIEW"
-            PR_BRANCH="$PR_BRANCH_REVIEW"
-            PR_STATE="$PR_STATE_REVIEW"
-          else
-            PR_NUMBER="$ISSUE_NUMBER"
-            PR_BRANCH=""
-            PR_STATE="$ISSUE_STATE"
-          fi
-
           PAYLOAD=$(jq -n \
-            --arg type "pr_comment" \
-            --argjson pr_number "${PR_NUMBER:-0}" \
+            --arg type "issue_comment" \
+            --argjson number "$ISSUE_NUMBER" \
+            --arg issue_title "$ISSUE_TITLE" \
+            --arg issue_body "$ISSUE_BODY" \
+            --arg issue_state "$ISSUE_STATE" \
             --arg comment_body "$COMMENT_BODY" \
             --arg comment_author "$COMMENT_AUTHOR" \
-            --arg pr_branch "$PR_BRANCH" \
-            --arg repo "$REPO" \
-            --arg pr_state "$PR_STATE" \
             --argjson comment_id "${COMMENT_ID:-0}" \
+            --arg repo "$REPO" \
             --argjson labels "$LABELS" \
-            '{type: $type, pr_number: $pr_number, number: $pr_number, comment_body: $comment_body, comment_author: $comment_author, pr_branch: $pr_branch, repo: $repo, pr_state: $pr_state, comment_id: $comment_id, labels: $labels}')
+            '{type: $type, number: $number, issue_title: $issue_title, issue_body: $issue_body, issue_state: $issue_state, comment_body: $comment_body, comment_author: $comment_author, comment_id: $comment_id, repo: $repo, labels: $labels}')
 
           SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$AGENT_SECRET" | awk '{print $2}')"
 

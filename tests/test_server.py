@@ -13,7 +13,7 @@ from receiver.server import (
     LABELS,
     check_blocked_label,
     check_circuit_breaker,
-    check_pr_state,
+    check_state,
     check_self_reply,
     record_circuit_breaker,
     verify_hmac,
@@ -46,37 +46,55 @@ class TestSelfReplyGuard:
 
 
 class TestCircuitBreaker:
-    """Circuit breaker limits responses per PR."""
+    """Circuit breaker limits responses per entity (type-scoped)."""
 
     def setup_method(self) -> None:
         _circuit_breaker_state.clear()
 
     def test_allows_first_response(self) -> None:
-        assert check_circuit_breaker("r", 1, max_responses=3, window=600) is None
+        assert check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600) is None
 
     def test_trips_after_max(self) -> None:
         for _ in range(3):
-            record_circuit_breaker("r", 1)
-        result = check_circuit_breaker("r", 1, max_responses=3, window=600)
+            record_circuit_breaker("r", "pr_comment", 1)
+        result = check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600)
         assert result is not None
         assert "circuit_breaker" in result
 
     def test_different_prs_independent(self) -> None:
         for _ in range(3):
-            record_circuit_breaker("r", 1)
+            record_circuit_breaker("r", "pr_comment", 1)
         # PR #2 should still be allowed
-        assert check_circuit_breaker("r", 2, max_responses=3, window=600) is None
+        assert check_circuit_breaker("r", "pr_comment", 2, max_responses=3, window=600) is None
+
+    def test_different_types_independent(self) -> None:
+        """Issue #1 and PR #1 have separate circuit breakers."""
+        for _ in range(3):
+            record_circuit_breaker("r", "pr_comment", 1)
+        # Issue comment on #1 should still be allowed
+        assert check_circuit_breaker("r", "issue_comment", 1, max_responses=3, window=600) is None
 
 
-class TestPRStateGuard:
-    def test_rejects_closed(self) -> None:
-        assert check_pr_state("closed") == "pr_closed"
+class TestStateGuard:
+    """State guard for PRs and issues."""
 
-    def test_rejects_merged(self) -> None:
-        assert check_pr_state("merged") == "pr_merged"
+    def test_rejects_closed_pr(self) -> None:
+        assert check_state("closed", "pr") == "pr_closed"
 
-    def test_allows_open(self) -> None:
-        assert check_pr_state("open") is None
+    def test_rejects_merged_pr(self) -> None:
+        assert check_state("merged", "pr") == "pr_merged"
+
+    def test_allows_open_pr(self) -> None:
+        assert check_state("open", "pr") is None
+
+    def test_rejects_closed_issue(self) -> None:
+        assert check_state("closed", "issue") == "issue_closed"
+
+    def test_allows_open_issue(self) -> None:
+        assert check_state("open", "issue") is None
+
+    def test_defaults_to_pr(self) -> None:
+        assert check_state("closed") == "pr_closed"
 
 
 class TestBlockedLabelGuard:

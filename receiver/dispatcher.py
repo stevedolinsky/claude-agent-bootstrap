@@ -17,7 +17,7 @@ from typing import Any
 
 from .exceptions import BudgetExhaustedError, WorkerSpawnError, WorkerTimeoutError
 from .queue import QueueItem, WorkQueue
-from .server import Config, LABELS
+from .server import Config, LABELS, record_circuit_breaker
 
 log = logging.getLogger(__name__)
 
@@ -354,9 +354,13 @@ class Dispatcher:
                 self._track_cost(repo, item, result)
 
                 if result.exit_code == 0:
+                    # Record circuit breaker for comment types
+                    if item.type in ("pr_comment", "issue_comment"):
+                        record_circuit_breaker(repo, item.type, item.number)
+
                     # Check for epic continuation
                     self._handle_epic_continuation(repo, item)
-                    self._queue.complete(repo, item.type, item.number)
+                    self._queue.complete(repo, item.dedup_key)
 
                     self._events.log(
                         "done",
@@ -375,7 +379,7 @@ class Dispatcher:
                     number=item.number,
                     block_reason="worker_timeout",
                 )
-                self._queue.complete(repo, item.type, item.number)
+                self._queue.complete(repo, item.dedup_key)
                 log.error("Worker timed out for %s #%d", repo, item.number)
 
             except WorkerSpawnError as exc:
@@ -385,11 +389,11 @@ class Dispatcher:
                     number=item.number,
                     detail=str(exc),
                 )
-                self._queue.complete(repo, item.type, item.number)
+                self._queue.complete(repo, item.dedup_key)
 
             except BudgetExhaustedError:
                 log.warning("Budget exhausted after %s #%d", repo, item.number)
-                self._queue.complete(repo, item.type, item.number)
+                self._queue.complete(repo, item.dedup_key)
                 # Don't break — let the loop check _budget_exhausted flag
 
         log.info("Dispatch loop exiting for %s", repo)
@@ -397,7 +401,7 @@ class Dispatcher:
     def _select_model(self, item: QueueItem) -> str:
         """Select model via LLM triage. Sonnet analyzes complexity, routes to Opus if needed."""
         # PR comments and maintenance always use Sonnet (fast/cheap)
-        if item.type in ("pr_comment", "maintenance"):
+        if item.type in ("pr_comment", "issue_comment", "maintenance"):
             return "claude-sonnet-4-6"
 
         # No content to analyze → default Sonnet
@@ -552,7 +556,7 @@ class Dispatcher:
                 item.attempts,
                 self._config.max_retries,
             )
-            self._queue.complete(repo, item.type, item.number)
+            self._queue.complete(repo, item.dedup_key)
             self._queue.enqueue(repo, item)
         else:
             log.error(
@@ -567,7 +571,7 @@ class Dispatcher:
                 number=item.number,
                 block_reason=f"failed_after_{item.attempts}_attempts",
             )
-            self._queue.complete(repo, item.type, item.number)
+            self._queue.complete(repo, item.dedup_key)
 
     def _handle_epic_continuation(self, repo: str, item: QueueItem) -> None:
         """Check plan file for remaining steps. Re-enqueue if more work."""

@@ -68,6 +68,73 @@ class TestDedup:
         assert tmp_queue.enqueue(repo, comment) is True
 
 
+class TestCommentDedup:
+    """Comment-level dedup: different comment_ids on same number are separate items."""
+
+    def test_different_comments_same_pr_both_enqueued(self, tmp_queue: WorkQueue) -> None:
+        repo = "owner/repo"
+        c1 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:00:00Z",
+            priority=True, comment_id=100,
+        )
+        c2 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:01:00Z",
+            priority=True, comment_id=200,
+        )
+
+        assert tmp_queue.enqueue(repo, c1) is True
+        assert tmp_queue.enqueue(repo, c2) is True
+        assert tmp_queue.get_depth(repo) == 2
+
+    def test_same_comment_id_rejected(self, tmp_queue: WorkQueue) -> None:
+        repo = "owner/repo"
+        c1 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:00:00Z",
+            priority=True, comment_id=100,
+        )
+        c2 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:01:00Z",
+            priority=True, comment_id=100,
+        )
+
+        assert tmp_queue.enqueue(repo, c1) is True
+        assert tmp_queue.enqueue(repo, c2) is False
+
+    def test_issue_comment_dedup(self, tmp_queue: WorkQueue) -> None:
+        repo = "owner/repo"
+        c1 = QueueItem(
+            type="issue_comment", number=42, queued_at="2026-01-01T00:00:00Z",
+            priority=True, comment_id=300,
+        )
+        c2 = QueueItem(
+            type="issue_comment", number=42, queued_at="2026-01-01T00:01:00Z",
+            priority=True, comment_id=400,
+        )
+
+        assert tmp_queue.enqueue(repo, c1) is True
+        assert tmp_queue.enqueue(repo, c2) is True
+
+    def test_complete_with_comment_dedup_key(self, tmp_queue: WorkQueue) -> None:
+        repo = "owner/repo"
+        c1 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:00:00Z",
+            priority=True, comment_id=100,
+        )
+        tmp_queue.enqueue(repo, c1)
+        taken = tmp_queue.take_next(repo)
+        assert taken is not None
+
+        # Complete using dedup_key
+        tmp_queue.complete(repo, taken.dedup_key)
+
+        # Should now be able to enqueue same comment again
+        c2 = QueueItem(
+            type="pr_comment", number=10, queued_at="2026-01-01T00:02:00Z",
+            priority=True, comment_id=100,
+        )
+        assert tmp_queue.enqueue(repo, c2) is True
+
+
 class TestPriority:
     """Priority items processed before regular items."""
 

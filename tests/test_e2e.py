@@ -233,6 +233,63 @@ class TestWebhookToQueue:
         assert len(queued) == 1
 
 
+    def test_issue_comment_enqueued(self, e2e_env: dict) -> None:
+        """Issue comment webhook → priority queue item."""
+        resp = _post_webhook(e2e_env["port"], e2e_env["secret"], {
+            "type": "issue_comment",
+            "number": 42,
+            "issue_title": "Add feature",
+            "issue_body": "Please add this feature",
+            "issue_state": "open",
+            "comment_body": "Can you also handle null inputs?",
+            "comment_author": "human",
+            "comment_id": 500,
+            "repo": "owner/repo",
+            "labels": ["agent"],
+        })
+        assert resp.status == 202
+
+        data = json.loads(resp.read())
+        assert data["queued"] is True
+
+        events = _read_events(e2e_env["events_file"])
+        queued = _events_with_action(events, "queue_added")
+        assert any(e["number"] == 42 for e in queued)
+
+    def test_two_comments_same_pr_both_enqueued(self, e2e_env: dict) -> None:
+        """Two different comments on same PR should both be queued (comment-level dedup)."""
+        payload1 = {
+            "type": "pr_comment",
+            "pr_number": 10,
+            "number": 10,
+            "comment_body": "Fix the typo",
+            "comment_author": "human",
+            "pr_branch": "feat/thing",
+            "repo": "owner/repo2",
+            "pr_state": "open",
+            "comment_id": 601,
+        }
+        payload2 = {
+            "type": "pr_comment",
+            "pr_number": 10,
+            "number": 10,
+            "comment_body": "Also fix the import",
+            "comment_author": "human",
+            "pr_branch": "feat/thing",
+            "repo": "owner/repo2",
+            "pr_state": "open",
+            "comment_id": 602,
+        }
+        resp1 = _post_webhook(e2e_env["port"], e2e_env["secret"], payload1)
+        assert resp1.status == 202
+        resp1.read()
+
+        resp2 = _post_webhook(e2e_env["port"], e2e_env["secret"], payload2)
+        assert resp2.status == 202
+        data2 = json.loads(resp2.read())
+        assert data2["queued"] is True
+
+
 class TestGuards:
     """Guard functions prevent unwanted processing."""
 
@@ -276,6 +333,58 @@ class TestGuards:
             "body": "Something",
             "repo": "owner/repo",
             "labels": ["agent", "agent-blocked"],
+        })
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert data["skipped"] == "blocked_label"
+
+
+    def test_issue_comment_self_reply_skipped(self, e2e_env: dict) -> None:
+        resp = _post_webhook(e2e_env["port"], e2e_env["secret"], {
+            "type": "issue_comment",
+            "number": 42,
+            "issue_title": "Test issue",
+            "issue_body": "Test body",
+            "issue_state": "open",
+            "comment_body": "Done!\n<!-- claude-agent -->",
+            "comment_author": "bot",
+            "comment_id": 700,
+            "repo": "owner/repo",
+            "labels": ["agent"],
+        })
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert data["skipped"] == "self_reply_marker"
+
+    def test_closed_issue_comment_skipped(self, e2e_env: dict) -> None:
+        resp = _post_webhook(e2e_env["port"], e2e_env["secret"], {
+            "type": "issue_comment",
+            "number": 42,
+            "issue_title": "Closed issue",
+            "issue_body": "Body",
+            "issue_state": "closed",
+            "comment_body": "Can you reopen?",
+            "comment_author": "human",
+            "comment_id": 800,
+            "repo": "owner/repo",
+            "labels": [],
+        })
+        assert resp.status == 200
+        data = json.loads(resp.read())
+        assert data["skipped"] == "issue_closed"
+
+    def test_issue_comment_blocked_label_skipped(self, e2e_env: dict) -> None:
+        resp = _post_webhook(e2e_env["port"], e2e_env["secret"], {
+            "type": "issue_comment",
+            "number": 42,
+            "issue_title": "Blocked issue",
+            "issue_body": "Body",
+            "issue_state": "open",
+            "comment_body": "Any update?",
+            "comment_author": "human",
+            "comment_id": 900,
+            "repo": "owner/repo",
+            "labels": ["agent-blocked"],
         })
         assert resp.status == 200
         data = json.loads(resp.read())

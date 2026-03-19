@@ -139,12 +139,12 @@ _circuit_breaker_lock = threading.Lock()
 
 
 def check_circuit_breaker(
-    repo: str, pr_number: int, max_responses: int = 3, window: int = 600
+    repo: str, item_type: str, number: int, max_responses: int = 3, window: int = 600
 ) -> str | None:
-    """Returns skip reason if PR has exceeded response limit."""
+    """Returns skip reason if item has exceeded response limit."""
     import time
 
-    key = f"{repo}#{pr_number}"
+    key = f"{repo}#{item_type}#{number}"
     now = time.monotonic()
 
     with _circuit_breaker_lock:
@@ -158,19 +158,19 @@ def check_circuit_breaker(
         return None
 
 
-def record_circuit_breaker(repo: str, pr_number: int) -> None:
+def record_circuit_breaker(repo: str, item_type: str, number: int) -> None:
     """Record a response for circuit breaker tracking."""
     import time
 
-    key = f"{repo}#{pr_number}"
+    key = f"{repo}#{item_type}#{number}"
     with _circuit_breaker_lock:
         _circuit_breaker_state.setdefault(key, []).append(time.monotonic())
 
 
-def check_pr_state(pr_state: str) -> str | None:
-    """Returns skip reason if PR is closed/merged."""
-    if pr_state in ("closed", "merged"):
-        return f"pr_{pr_state}"
+def check_state(state: str, entity: str = "pr") -> str | None:
+    """Returns skip reason if entity is closed/merged."""
+    if state in ("closed", "merged"):
+        return f"{entity}_{state}"
     return None
 
 
@@ -265,6 +265,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     comment_id=payload.get("comment_id"),
                 )
 
+            elif event_type == "issue_comment":
+                skip = self._check_issue_comment_guards(payload)
+                if skip:
+                    self.event_logger.log(
+                        "skipped",
+                        repo=repo,
+                        event_type=event_type,
+                        number=number,
+                        skip_reason=skip,
+                    )
+                    self._respond(200, {"skipped": skip})
+                    return
+
+                item = QueueItem(
+                    type="issue_comment",
+                    number=number,
+                    queued_at=QueueItem.now_iso(),
+                    priority=True,
+                    comment_id=payload.get("comment_id"),
+                )
+
             elif event_type == "issue":
                 labels = payload.get("labels", [])
                 skip = check_blocked_label(labels)
@@ -337,7 +358,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return skip
 
         pr_state = payload.get("pr_state", "open")
-        skip = check_pr_state(pr_state)
+        skip = check_state(pr_state, "pr")
         if skip:
             return skip
 
@@ -345,7 +366,39 @@ class WebhookHandler(BaseHTTPRequestHandler):
         pr_number = payload.get("pr_number", 0)
         skip = check_circuit_breaker(
             repo,
+            "pr_comment",
             pr_number,
+            max_responses=self.config.circuit_breaker_max,
+            window=self.config.circuit_breaker_window,
+        )
+        if skip:
+            return skip
+
+        labels = payload.get("labels", [])
+        skip = check_blocked_label(labels)
+        if skip:
+            return skip
+
+        return None
+
+    def _check_issue_comment_guards(self, payload: dict) -> str | None:
+        """Run all guards for issue comment events."""
+        comment_body = payload.get("comment_body", "")
+        skip = check_self_reply(comment_body)
+        if skip:
+            return skip
+
+        issue_state = payload.get("issue_state", "open")
+        skip = check_state(issue_state, "issue")
+        if skip:
+            return skip
+
+        repo = payload.get("repo", "")
+        number = payload.get("number", 0)
+        skip = check_circuit_breaker(
+            repo,
+            "issue_comment",
+            number,
             max_responses=self.config.circuit_breaker_max,
             window=self.config.circuit_breaker_window,
         )
