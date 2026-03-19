@@ -193,9 +193,9 @@ maybe_start_receiver() {
     read -rp "  Start the webhook receiver? [y/N] " answer || answer=""
     [[ "${answer,,}" == "y" ]] || return 0
 
-    "${SCRIPT_DIR}/start.sh" \
+    bash "${SCRIPT_DIR}/start.sh" \
         && ok "Receiver started" \
-        || warn "Receiver start failed — run manually: ${SCRIPT_DIR}/start.sh"
+        || warn "Receiver start failed — run manually: bash ${SCRIPT_DIR}/start.sh"
 }
 
 # ---------------------------------------------------------------------------
@@ -243,11 +243,12 @@ main() {
             git commit -m "chore: configure agent fleet workflows and settings" --no-verify 2>/dev/null
             local branch
             branch=$(git branch --show-current)
+            git pull origin "$branch" --rebase 2>/dev/null || true
             if git push -u origin "$branch" 2>/dev/null; then
                 ok "Pushed to GitHub — workflows are live on '${branch}'"
             else
                 warn "Push failed. Try:"
-                echo "  git pull origin ${branch} --rebase && git push -u origin ${branch}"
+                echo "  git push -u origin ${branch}"
             fi
         else
             info "No config changes to push — GitHub is up to date"
