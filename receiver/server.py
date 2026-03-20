@@ -273,6 +273,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         number=number,
                         skip_reason=skip,
                     )
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
                     self._respond(200, {"skipped": skip})
                     return
 
@@ -294,6 +295,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         number=number,
                         skip_reason=skip,
                     )
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
                     self._respond(200, {"skipped": skip})
                     return
 
@@ -316,6 +318,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         number=number,
                         skip_reason=skip,
                     )
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
                     self._respond(200, {"skipped": skip})
                     return
 
@@ -348,6 +351,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     number=number,
                     skip_reason="duplicate",
                 )
+                prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason="duplicate").inc()
                 self._respond(200, {"skipped": "duplicate"})
                 return
 
