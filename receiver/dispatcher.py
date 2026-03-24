@@ -43,6 +43,8 @@ VALID_ACTIONS = frozenset({
     "cost_tracked",
     "budget_exhausted",
     "triage",
+    "guard_checked",
+    "receiver_started",
 })
 
 
@@ -366,6 +368,7 @@ class Dispatcher:
                 "triage",
                 repo=repo,
                 number=item.number,
+                pr_number=item.pr_number,
                 model=model,
                 complexity="complex" if "opus" in model else "simple",
             )
@@ -374,6 +377,7 @@ class Dispatcher:
                 "dispatched",
                 repo=repo,
                 number=item.number,
+                pr_number=item.pr_number,
                 model=model,
             )
 
@@ -396,6 +400,7 @@ class Dispatcher:
                         "done",
                         repo=repo,
                         number=item.number,
+                        pr_number=item.pr_number,
                         model=model,
                         duration_seconds=result.duration_ms / 1000,
                     )
@@ -413,6 +418,7 @@ class Dispatcher:
                     "blocked",
                     repo=repo,
                     number=item.number,
+                    pr_number=item.pr_number,
                     block_reason="worker_timeout",
                 )
                 prom.ISSUES_TOTAL.labels(repo=repo, action="blocked", reason="worker_timeout").inc()
@@ -426,6 +432,7 @@ class Dispatcher:
                     "error",
                     repo=repo,
                     number=item.number,
+                    pr_number=item.pr_number,
                     detail=str(exc),
                 )
                 prom.ISSUES_TOTAL.labels(repo=repo, action="error", reason=str(exc)[:50]).inc()
@@ -520,6 +527,7 @@ class Dispatcher:
             "spawned",
             repo=repo,
             number=item.number,
+            pr_number=item.pr_number,
             model=model,
         )
         prom.ISSUES_TOTAL.labels(repo=repo, action="spawned", reason="").inc()
@@ -614,6 +622,7 @@ class Dispatcher:
                 "blocked",
                 repo=repo,
                 number=item.number,
+                pr_number=item.pr_number,
                 block_reason=f"failed_after_{item.attempts}_attempts",
             )
             self._queue.complete(repo, item.dedup_key)
@@ -666,6 +675,7 @@ class Dispatcher:
                 "cost_tracked",
                 repo=repo,
                 number=item.number,
+                pr_number=item.pr_number,
                 model=result.model,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,

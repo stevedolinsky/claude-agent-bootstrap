@@ -97,6 +97,14 @@ def main() -> None:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
+    # Emit receiver_started event (helps diagnose circuit breaker state resets)
+    events.log(
+        "receiver_started",
+        detail="circuit_breaker_state_reset",
+        port=config.port,
+        daily_budget_usd=config.daily_budget_usd,
+    )
+
     log.info(
         "Receiver started on %s:%d (daily budget: $%.2f)",
         config.bind_address,
