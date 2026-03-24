@@ -225,5 +225,6 @@ class TestValidActions:
             "queue_added", "dispatched", "plan_created", "step_started",
             "step_completed", "pr_created", "blocked",
             "cost_tracked", "budget_exhausted", "triage",
+            "guard_checked", "receiver_started",
         }
         assert VALID_ACTIONS == expected

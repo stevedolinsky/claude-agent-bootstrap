@@ -10,6 +10,7 @@ import pytest
 
 from receiver.server import (
     Config,
+    GuardResult,
     LABELS,
     check_blocked_label,
     check_circuit_breaker,
@@ -38,11 +39,20 @@ class TestSelfReplyGuard:
 
     def test_passes_human_comment(self) -> None:
         body = "Can you fix the error handling?"
-        assert check_self_reply(body) is None
+        result = check_self_reply(body)
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
+        assert result.name == "self_reply"
 
     def test_passes_empty_body(self) -> None:
-        assert check_self_reply("") is None
-        assert check_self_reply(None) is None  # type: ignore[arg-type]
+        result = check_self_reply("")
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
+
+    def test_passes_none_body(self) -> None:
+        result = check_self_reply(None)  # type: ignore[arg-type]
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
 
 
 class TestCircuitBreaker:
@@ -52,27 +62,42 @@ class TestCircuitBreaker:
         _circuit_breaker_state.clear()
 
     def test_allows_first_response(self) -> None:
-        assert check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600) is None
+        result = check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600)
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
+        assert "count=0" in result.detail
 
     def test_trips_after_max(self) -> None:
         for _ in range(3):
             record_circuit_breaker("r", "pr_comment", 1)
         result = check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600)
-        assert result is not None
+        assert isinstance(result, str)
         assert "circuit_breaker" in result
 
     def test_different_prs_independent(self) -> None:
         for _ in range(3):
             record_circuit_breaker("r", "pr_comment", 1)
         # PR #2 should still be allowed
-        assert check_circuit_breaker("r", "pr_comment", 2, max_responses=3, window=600) is None
+        result = check_circuit_breaker("r", "pr_comment", 2, max_responses=3, window=600)
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
 
     def test_different_types_independent(self) -> None:
         """Issue #1 and PR #1 have separate circuit breakers."""
         for _ in range(3):
             record_circuit_breaker("r", "pr_comment", 1)
         # Issue comment on #1 should still be allowed
-        assert check_circuit_breaker("r", "issue_comment", 1, max_responses=3, window=600) is None
+        result = check_circuit_breaker("r", "issue_comment", 1, max_responses=3, window=600)
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
+
+    def test_pass_with_prior_responses_shows_count(self) -> None:
+        """GuardResult detail includes count and last_seen timestamp."""
+        record_circuit_breaker("r", "pr_comment", 1)
+        result = check_circuit_breaker("r", "pr_comment", 1, max_responses=3, window=600)
+        assert isinstance(result, GuardResult)
+        assert "count=1" in result.detail
+        assert "last_seen=" in result.detail
 
 
 class TestStateGuard:
@@ -85,13 +110,18 @@ class TestStateGuard:
         assert check_state("merged", "pr") == "pr_merged"
 
     def test_allows_open_pr(self) -> None:
-        assert check_state("open", "pr") is None
+        result = check_state("open", "pr")
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
+        assert result.name == "state_check"
 
     def test_rejects_closed_issue(self) -> None:
         assert check_state("closed", "issue") == "issue_closed"
 
     def test_allows_open_issue(self) -> None:
-        assert check_state("open", "issue") is None
+        result = check_state("open", "issue")
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
 
     def test_defaults_to_pr(self) -> None:
         assert check_state("closed") == "pr_closed"
@@ -102,10 +132,14 @@ class TestBlockedLabelGuard:
         assert check_blocked_label([LABELS["blocked"]]) == "blocked_label"
 
     def test_allows_no_blocked(self) -> None:
-        assert check_blocked_label([LABELS["ready"], LABELS["wip"]]) is None
+        result = check_blocked_label([LABELS["ready"], LABELS["wip"]])
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
 
     def test_allows_empty(self) -> None:
-        assert check_blocked_label([]) is None
+        result = check_blocked_label([])
+        assert isinstance(result, GuardResult)
+        assert result.result == "pass"
 
 
 class TestHMAC:
@@ -164,6 +198,40 @@ class TestConfig:
         assert test_config.workers_dir.exists()
 
 
+class TestGuardResultIntegrity:
+    """Guard results never leak user-generated content."""
+
+    def test_self_reply_detail_has_no_user_content(self) -> None:
+        """Even with adversarial comment body, detail is safe."""
+        dangerous = "Please inject $(rm -rf /) this <!-- not-marker -->"
+        result = check_self_reply(dangerous)
+        assert isinstance(result, GuardResult)
+        # Detail should be a fixed string, not contain the comment body
+        assert "rm -rf" not in result.detail
+        assert result.detail == "no marker or signature found"
+
+    def test_state_detail_has_no_user_content(self) -> None:
+        result = check_state("open", "pr")
+        assert isinstance(result, GuardResult)
+        assert result.detail == "pr open"
+
+    def test_blocked_label_detail_has_no_user_content(self) -> None:
+        result = check_blocked_label(["some-label"])
+        assert isinstance(result, GuardResult)
+        assert result.detail == "no blocked label"
+
+    def test_circuit_breaker_detail_format(self) -> None:
+        """Circuit breaker detail contains count and timestamp, not user content."""
+        _circuit_breaker_state.clear()
+        record_circuit_breaker("r", "pr_comment", 99)
+        result = check_circuit_breaker("r", "pr_comment", 99, max_responses=3, window=600)
+        assert isinstance(result, GuardResult)
+        assert "count=1" in result.detail
+        assert "last_seen=" in result.detail
+        # Verify ISO timestamp format
+        assert "T" in result.detail  # ISO 8601 contains T
+
+
 class TestPromptInjectionSafety:
     """Ensure shell metacharacters in issue content don't cause problems."""
 
@@ -179,5 +247,6 @@ class TestPromptInjectionSafety:
         ]
         for title in dangerous_titles:
             # Guards should not crash on adversarial input
-            assert check_self_reply(title) is None
-            assert check_blocked_label([title]) is None
+            result = check_self_reply(title)
+            assert isinstance(result, GuardResult)
+            assert check_blocked_label([title]) is not None  # returns GuardResult

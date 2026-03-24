@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from datetime import datetime, timezone
+
 from .exceptions import WebhookAuthError
 from . import metrics as prom
 from .metrics import generate_latest, CONTENT_TYPE_LATEST
@@ -121,10 +123,19 @@ class Config:
 # Guards
 # ---------------------------------------------------------------------------
 
-def check_self_reply(comment_body: str) -> str | None:
-    """Returns skip reason if self-reply detected, None if safe."""
+@dataclass(frozen=True, slots=True)
+class GuardResult:
+    """Result of a single guard check."""
+
+    name: str      # e.g., "self_reply_marker"
+    result: str    # "pass" or "fail"
+    detail: str    # human-readable, never includes user-generated content
+
+
+def check_self_reply(comment_body: str) -> str | GuardResult:
+    """Returns skip reason (str) if self-reply detected, GuardResult on pass."""
     if not comment_body:
-        return None
+        return GuardResult("self_reply", "pass", "empty body")
     # Layer 1: HTML marker
     if "<!-- claude-agent -->" in comment_body:
         return "self_reply_marker"
@@ -132,7 +143,7 @@ def check_self_reply(comment_body: str) -> str | None:
     for sig in ("· claude-sonnet-", "· claude-opus-", "· claude-haiku-"):
         if sig in comment_body:
             return "self_reply_signature"
-    return None
+    return GuardResult("self_reply", "pass", "no marker or signature found")
 
 
 # Module-level state for circuit breaker (in-memory, not persisted)
@@ -142,12 +153,12 @@ _circuit_breaker_lock = threading.Lock()
 
 def check_circuit_breaker(
     repo: str, item_type: str, number: int, max_responses: int = 3, window: int = 600
-) -> str | None:
-    """Returns skip reason if item has exceeded response limit."""
+) -> str | GuardResult:
+    """Returns skip reason (str) if limit exceeded, GuardResult on pass."""
     import time
 
     key = f"{repo}#{item_type}#{number}"
-    now = time.monotonic()
+    now = time.time()
 
     with _circuit_breaker_lock:
         timestamps = _circuit_breaker_state.get(key, [])
@@ -157,7 +168,16 @@ def check_circuit_breaker(
 
         if len(timestamps) >= max_responses:
             return f"circuit_breaker_{len(timestamps)}_in_{window}s"
-        return None
+
+        count = len(timestamps)
+        if timestamps:
+            last_iso = datetime.fromtimestamp(timestamps[-1], tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            detail = f"count={count}, last_seen={last_iso}"
+        else:
+            detail = f"count={count}, no_prior_responses"
+        return GuardResult("circuit_breaker", "pass", detail)
 
 
 def record_circuit_breaker(repo: str, item_type: str, number: int) -> None:
@@ -166,21 +186,21 @@ def record_circuit_breaker(repo: str, item_type: str, number: int) -> None:
 
     key = f"{repo}#{item_type}#{number}"
     with _circuit_breaker_lock:
-        _circuit_breaker_state.setdefault(key, []).append(time.monotonic())
+        _circuit_breaker_state.setdefault(key, []).append(time.time())
 
 
-def check_state(state: str, entity: str = "pr") -> str | None:
-    """Returns skip reason if entity is closed/merged."""
+def check_state(state: str, entity: str = "pr") -> str | GuardResult:
+    """Returns skip reason (str) if closed/merged, GuardResult on pass."""
     if state in ("closed", "merged"):
         return f"{entity}_{state}"
-    return None
+    return GuardResult("state_check", "pass", f"{entity} {state}")
 
 
-def check_blocked_label(labels: list[str]) -> str | None:
-    """Returns skip reason if agent-blocked label present."""
+def check_blocked_label(labels: list[str]) -> str | GuardResult:
+    """Returns skip reason (str) if blocked, GuardResult on pass."""
     if LABELS["blocked"] in labels:
         return "blocked_label"
-    return None
+    return GuardResult("blocked_label", "pass", "no blocked label")
 
 
 # ---------------------------------------------------------------------------
@@ -264,18 +284,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
             # 4. Run guards and route
             if event_type == "pr_comment":
-                skip = self._check_pr_comment_guards(payload)
-                if skip:
+                guard_result = self._check_pr_comment_guards(payload)
+                if isinstance(guard_result, str):
                     self.event_logger.log(
                         "skipped",
                         repo=repo,
                         event_type=event_type,
                         number=number,
-                        skip_reason=skip,
+                        skip_reason=guard_result,
                     )
-                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
-                    self._respond(200, {"skipped": skip})
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=guard_result).inc()
+                    self._respond(200, {"skipped": guard_result})
                     return
+
+                pr_number = payload.get("pr_number")
+                self._emit_guard_checked(
+                    guard_result, repo, event_type, number,
+                    pr_number=pr_number,
+                    comment_author=payload.get("comment_author", "unknown"),
+                )
 
                 item = QueueItem(
                     type="pr_comment",
@@ -283,21 +310,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     queued_at=QueueItem.now_iso(),
                     priority=True,
                     comment_id=payload.get("comment_id"),
+                    pr_number=pr_number,
                 )
 
             elif event_type == "issue_comment":
-                skip = self._check_issue_comment_guards(payload)
-                if skip:
+                guard_result = self._check_issue_comment_guards(payload)
+                if isinstance(guard_result, str):
                     self.event_logger.log(
                         "skipped",
                         repo=repo,
                         event_type=event_type,
                         number=number,
-                        skip_reason=skip,
+                        skip_reason=guard_result,
                     )
-                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
-                    self._respond(200, {"skipped": skip})
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=guard_result).inc()
+                    self._respond(200, {"skipped": guard_result})
                     return
+
+                pr_number = payload.get("pr_number")
+                self._emit_guard_checked(
+                    guard_result, repo, event_type, number,
+                    pr_number=pr_number,
+                    comment_author=payload.get("comment_author", "unknown"),
+                )
 
                 item = QueueItem(
                     type="issue_comment",
@@ -305,22 +340,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     queued_at=QueueItem.now_iso(),
                     priority=True,
                     comment_id=payload.get("comment_id"),
+                    pr_number=pr_number,
                 )
 
             elif event_type == "issue":
                 labels = payload.get("labels", [])
-                skip = check_blocked_label(labels)
-                if skip:
+                check = check_blocked_label(labels)
+                if isinstance(check, str):
                     self.event_logger.log(
                         "skipped",
                         repo=repo,
                         event_type=event_type,
                         number=number,
-                        skip_reason=skip,
+                        skip_reason=check,
                     )
-                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=skip).inc()
-                    self._respond(200, {"skipped": skip})
+                    prom.ISSUES_TOTAL.labels(repo=repo, action="skipped", reason=check).inc()
+                    self._respond(200, {"skipped": check})
                     return
+
+                self._emit_guard_checked(
+                    [check], repo, event_type, number,
+                    pr_number=None,
+                    comment_author=None,
+                )
 
                 item = QueueItem(
                     type="issue",
@@ -360,6 +402,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "queue_added",
                 repo=repo,
                 number=item.number,
+                pr_number=item.pr_number,
                 queue_depth=depth,
             )
             prom.QUEUE_DEPTH.labels(repo=repo).set(depth)
@@ -375,67 +418,115 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.exception("Error handling webhook")
             self._respond(500, {"error": "internal error"})
 
-    def _check_pr_comment_guards(self, payload: dict) -> str | None:
-        """Run all guards for PR comment events."""
+    def _check_pr_comment_guards(
+        self, payload: dict
+    ) -> str | list[GuardResult]:
+        """Run all guards for PR comment events.
+
+        Returns skip reason (str) on first failure, or list of GuardResult on pass.
+        """
+        results: list[GuardResult] = []
+
         comment_body = payload.get("comment_body", "")
-        skip = check_self_reply(comment_body)
-        if skip:
-            return skip
+        check = check_self_reply(comment_body)
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         pr_state = payload.get("pr_state", "open")
-        skip = check_state(pr_state, "pr")
-        if skip:
-            return skip
+        check = check_state(pr_state, "pr")
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         repo = payload.get("repo", "")
         pr_number = payload.get("pr_number", 0)
-        skip = check_circuit_breaker(
+        check = check_circuit_breaker(
             repo,
             "pr_comment",
             pr_number,
             max_responses=self.config.circuit_breaker_max,
             window=self.config.circuit_breaker_window,
         )
-        if skip:
-            return skip
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         labels = payload.get("labels", [])
-        skip = check_blocked_label(labels)
-        if skip:
-            return skip
+        check = check_blocked_label(labels)
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
-        return None
+        return results
 
-    def _check_issue_comment_guards(self, payload: dict) -> str | None:
-        """Run all guards for issue comment events."""
+    def _check_issue_comment_guards(
+        self, payload: dict
+    ) -> str | list[GuardResult]:
+        """Run all guards for issue comment events.
+
+        Returns skip reason (str) on first failure, or list of GuardResult on pass.
+        """
+        results: list[GuardResult] = []
+
         comment_body = payload.get("comment_body", "")
-        skip = check_self_reply(comment_body)
-        if skip:
-            return skip
+        check = check_self_reply(comment_body)
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         issue_state = payload.get("issue_state", "open")
-        skip = check_state(issue_state, "issue")
-        if skip:
-            return skip
+        check = check_state(issue_state, "issue")
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         repo = payload.get("repo", "")
         number = payload.get("number", 0)
-        skip = check_circuit_breaker(
+        check = check_circuit_breaker(
             repo,
             "issue_comment",
             number,
             max_responses=self.config.circuit_breaker_max,
             window=self.config.circuit_breaker_window,
         )
-        if skip:
-            return skip
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
         labels = payload.get("labels", [])
-        skip = check_blocked_label(labels)
-        if skip:
-            return skip
+        check = check_blocked_label(labels)
+        if isinstance(check, str):
+            return check
+        results.append(check)
 
-        return None
+        return results
+
+    def _emit_guard_checked(
+        self,
+        guard_results: list[GuardResult],
+        repo: str,
+        event_type: str,
+        number: int,
+        *,
+        pr_number: int | None,
+        comment_author: str | None,
+    ) -> None:
+        """Emit a guard_checked event with flattened audit fields."""
+        guard_fields: dict[str, Any] = {}
+        for gr in guard_results:
+            guard_fields[f"guard_{gr.name}_result"] = gr.result
+            guard_fields[f"guard_{gr.name}_detail"] = gr.detail
+
+        self.event_logger.log(
+            "guard_checked",
+            repo=repo,
+            event_type=event_type,
+            number=number,
+            pr_number=pr_number,
+            comment_author=comment_author,
+            **guard_fields,
+        )
 
     def _respond(self, status: int, body: dict) -> None:
         """Send JSON response."""

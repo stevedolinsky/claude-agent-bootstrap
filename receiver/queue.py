@@ -29,6 +29,7 @@ class QueueItem:
     attempts: int = 0
     title: str = ""
     body: str = ""
+    pr_number: int | None = None  # PR number when known (pr_comment, issue_comment on PR)
 
     @property
     def dedup_key(self) -> tuple:
