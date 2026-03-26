@@ -205,26 +205,35 @@ p.write_text(json.dumps(data, indent=2))
 # 6. Interactive Post-Bootstrap
 # ---------------------------------------------------------------------------
 
-maybe_start_dashboard() {
-    if [[ ! -t 0 ]]; then return; fi  # Non-interactive: skip
+maybe_enable_dashboard() {
+    local sentinel="${HOME}/.claude/agent-dashboard.enabled"
+
+    # Skip if already configured (e.g., re-running setup for a second repo)
+    if [[ -f "$sentinel" ]]; then
+        ok "Dashboard already enabled"
+        return
+    fi
+
+    if [[ ! -t 0 ]]; then
+        # Non-interactive: default to disabled (no sentinel = disabled)
+        return
+    fi
 
     echo ""
     local answer
-    read -rp "  Start the monitoring dashboard? (Grafana + Loki) [y/N] " answer || answer=""
-    [[ "${answer,,}" == "y" ]] || return 0
-
-    local dashboard_dir="${HOME}/claude-agent-dashboard"
-    if [[ ! -d "$dashboard_dir" ]]; then
-        read -rp "  Dashboard repo not found. Clone it? [y/N] " answer || answer=""
-        [[ "${answer,,}" == "y" ]] || return 0
-        git clone https://github.com/stevedolinsky/claude-agent-dashboard.git "$dashboard_dir" 2>/dev/null \
-            && ok "Cloned dashboard to ${dashboard_dir}" \
-            || { warn "Failed to clone dashboard repo"; return 0; }
+    read -rp "  Enable observability dashboard (Grafana + Prometheus)? [y/N] " answer || answer=""
+    if [[ "${answer,,}" == "y" ]]; then
+        if ! command -v docker &>/dev/null; then
+            warn "Docker not found. Install it: https://docs.docker.com/get-docker/"
+            echo "  After installing Docker, enable the dashboard by running:"
+            echo "    touch ~/.claude/agent-dashboard.enabled"
+            return
+        fi
+        touch "$sentinel"
+        ok "Dashboard enabled. It will start with the receiver via start.sh."
+    else
+        echo "  Dashboard disabled. Enable later: touch ~/.claude/agent-dashboard.enabled"
     fi
-
-    (cd "$dashboard_dir" && ./start.sh) \
-        && ok "Dashboard started" \
-        || warn "Dashboard start failed — run manually: cd $dashboard_dir && ./start.sh"
 }
 
 maybe_start_receiver() {
@@ -300,8 +309,8 @@ main() {
     # Register repo path in JSON sidecar for --directory support
     register_repo_path
 
-    # Interactive post-bootstrap: start dashboard and receiver
-    maybe_start_dashboard
+    # Interactive post-bootstrap: enable dashboard and start receiver
+    maybe_enable_dashboard
     maybe_start_receiver
 
     echo ""
