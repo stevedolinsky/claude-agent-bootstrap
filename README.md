@@ -70,13 +70,14 @@ cd your-project
 
 ```bash
 cd ~/claude-agent-bootstrap
-python3 -m receiver
+./start.sh
 ```
 
 You should see:
 
 ```
-Receiver started on 0.0.0.0:9876 (daily budget: $50.00)
+Receiver started (PID: 1234, log: ~/.claude/receiver.log)
+Dashboard started (Grafana: http://localhost:3000)    # if dashboard enabled
 ```
 
 **5. Label an issue with `agent`.** The pipeline triggers automatically.
@@ -244,9 +245,43 @@ All events are logged to `~/.claude/agent-events.jsonl` in structured JSONL form
 
 </details>
 
-Heartbeat events emit queue depth, daily cost, and worker count every 30 seconds.
+Heartbeat events emit queue depth, daily cost, and worker count every 30 seconds. Events older than 10 MiB are rotated automatically on receiver start.
 
-For a visual dashboard that reads these events, see [claude-agent-dashboard](https://github.com/stevedolinsky/claude-agent-dashboard).
+#### Dashboard (Optional)
+
+The `observability/` directory contains a Docker Compose stack (Grafana + Loki + Promtail + Prometheus) that visualizes events and metrics. Enable it during `setup.sh` or manually:
+
+```bash
+touch ~/.claude/agent-dashboard.enabled
+~/claude-agent-bootstrap/start.sh   # starts receiver + dashboard
+```
+
+Disable: `rm ~/.claude/agent-dashboard.enabled` then `./stop.sh`.
+
+Dashboard URL: http://localhost:3000 (Grafana, default credentials: admin/agent).
+
+<details>
+<summary><strong>Migration from separate dashboard repo</strong></summary>
+
+If you were previously using `~/claude-agent-dashboard/` as a separate repo:
+
+```bash
+# 1. Stop old dashboard
+cd ~/claude-agent-dashboard && docker compose down
+
+# 2. Copy volume data (preserves history)
+for vol in loki-data grafana-data prometheus-data promtail-positions; do
+    docker volume create "claude-agent-${vol}" 2>/dev/null
+    docker run --rm -v "claude-agent-dashboard_${vol}:/from:ro" \
+        -v "claude-agent-${vol}:/to" alpine sh -c 'cp -a /from/. /to/'
+done
+
+# 3. Enable and start
+touch ~/.claude/agent-dashboard.enabled
+~/claude-agent-bootstrap/start.sh
+```
+
+</details>
 
 ### Generated Files
 
