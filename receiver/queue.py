@@ -30,6 +30,8 @@ class QueueItem:
     title: str = ""
     body: str = ""
     pr_number: int | None = None  # PR number when known (pr_comment, issue_comment on PR)
+    comment_body: str = ""  # Comment text for pr_comment/issue_comment events
+    comment_author: str = ""  # GitHub username who posted the comment
 
     @property
     def dedup_key(self) -> tuple:
