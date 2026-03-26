@@ -59,6 +59,7 @@ class Config:
     daily_budget_usd: float = 50.0
     per_worker_budget_usd: float = 5.0
     reconciliation_interval: int = 1800  # 30 minutes
+    repo_paths: dict[str, str] = field(default_factory=dict)  # repo -> local path
 
     def __post_init__(self) -> None:
         # Expand ~ in all Path fields
@@ -73,6 +74,15 @@ class Config:
             val = getattr(self, f)
             if isinstance(val, Path):
                 object.__setattr__(self, f, val.expanduser())
+
+        # Load repo paths from JSON sidecar
+        repos_file = Path("~/.claude/agent-repos.json").expanduser()
+        if repos_file.exists() and not self.repo_paths:
+            try:
+                data = json.loads(repos_file.read_text())
+                object.__setattr__(self, "repo_paths", data)
+            except (json.JSONDecodeError, OSError):
+                pass
 
     @classmethod
     def from_file(cls, path: Path) -> Config:
@@ -311,6 +321,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     priority=True,
                     comment_id=payload.get("comment_id"),
                     pr_number=pr_number,
+                    comment_body=payload.get("comment_body", "")[:10000],
+                    comment_author=payload.get("comment_author", "unknown"),
                 )
 
             elif event_type == "issue_comment":
@@ -341,6 +353,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     priority=True,
                     comment_id=payload.get("comment_id"),
                     pr_number=pr_number,
+                    comment_body=payload.get("comment_body", "")[:10000],
+                    comment_author=payload.get("comment_author", "unknown"),
                 )
 
             elif event_type == "issue":

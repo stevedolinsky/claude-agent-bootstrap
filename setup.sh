@@ -160,7 +160,49 @@ setup_secret() {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Interactive Post-Bootstrap
+# 5. Repo Path Registry
+# ---------------------------------------------------------------------------
+
+register_repo_path() {
+    local repos_file="${HOME}/.claude/agent-repos.json"
+    local repo_full
+    repo_full="$(git remote get-url origin 2>/dev/null | sed 's|.*github\.com[:/]||;s|\.git$||')"
+    local repo_path
+    repo_path="$(pwd)"
+
+    if [[ -z "$repo_full" ]]; then
+        warn "Cannot determine repo name from git remote — skipping path registration"
+        return
+    fi
+
+    mkdir -p "${HOME}/.claude"
+
+    # Read existing JSON or start fresh
+    local existing="{}"
+    [[ -f "$repos_file" ]] && existing="$(cat "$repos_file")"
+
+    # Write updated JSON (jq if available, python3 fallback)
+    if command -v jq &>/dev/null; then
+        echo "$existing" | jq --arg repo "$repo_full" --arg path "$repo_path" \
+            '. + {($repo): $path}' > "$repos_file"
+    elif command -v python3 &>/dev/null; then
+        python3 -c "
+import json, pathlib
+p = pathlib.Path('$repos_file')
+data = json.loads(p.read_text()) if p.exists() else {}
+data['$repo_full'] = '$repo_path'
+p.write_text(json.dumps(data, indent=2))
+"
+    else
+        warn "Neither jq nor python3 available — cannot register repo path"
+        return
+    fi
+
+    ok "Registered ${repo_full} → ${repo_path}"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Interactive Post-Bootstrap
 # ---------------------------------------------------------------------------
 
 maybe_start_dashboard() {
@@ -254,6 +296,9 @@ main() {
             info "No config changes to push — GitHub is up to date"
         fi
     fi
+
+    # Register repo path in JSON sidecar for --directory support
+    register_repo_path
 
     # Interactive post-bootstrap: start dashboard and receiver
     maybe_start_dashboard

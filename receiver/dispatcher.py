@@ -549,6 +549,11 @@ class Dispatcher:
                 "--max-budget-usd", str(self._config.per_worker_budget_usd),
             ]
 
+            # Point worker at target repo for CLAUDE.md and settings
+            repo_path = self._config.repo_paths.get(repo)
+            if repo_path:
+                cmd.extend(["--directory", repo_path])
+
             with open(prompt_file) as stdin_file:
                 proc = subprocess.Popen(
                     cmd,
@@ -589,12 +594,35 @@ class Dispatcher:
             os.unlink(prompt_file)
 
     def _build_prompt(self, repo: str, item: QueueItem) -> str:
-        """Build the prompt for a worker. Placeholder for template system."""
-        return (
-            f"You are working on {repo}.\n"
-            f"Task type: {item.type}\n"
-            f"Issue/PR number: {item.number}\n"
-        )
+        """Build task-specific prompt for a worker.
+
+        Behavioral instructions come from the target repo's CLAUDE.md
+        (loaded via --directory). This prompt provides only the task context.
+        """
+        if item.type == "pr_comment":
+            return (
+                f"Respond to a PR comment on {repo} PR #{item.number}.\n"
+                f"Comment by {item.comment_author}:\n\n"
+                f"{item.comment_body}\n"
+            )
+        elif item.type == "issue_comment":
+            return (
+                f"Respond to an issue comment on {repo} issue #{item.number}.\n"
+                f"Comment by {item.comment_author}:\n\n"
+                f"{item.comment_body}\n"
+            )
+        elif item.type == "issue":
+            return (
+                f"Work on issue #{item.number} in {repo}.\n"
+                f"Title: {item.title}\n\n"
+                f"{item.body}\n"
+            )
+        else:
+            return (
+                f"You are working on {repo}.\n"
+                f"Task type: {item.type}\n"
+                f"Issue/PR number: {item.number}\n"
+            )
 
     def _handle_failure(
         self, repo: str, item: QueueItem, result: WorkerResult, model: str
